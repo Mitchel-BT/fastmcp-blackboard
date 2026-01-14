@@ -17,7 +17,7 @@ BLACKBOARD_APP_SECRET="2DXuZHi9QFZgKfIAkt8JJKhVWDBRdT0q"
 
 # FastMCP Cloud will give you this URL after first deploy
 # Format: https://your-project-name.fastmcp.app
-BASE_URL = "https://your-project.fastmcp.app"          # UPDATE AFTER DEPLOY
+BASE_URL = "https://blackboard-mcp.fastmcp.app/mcp"          # UPDATE AFTER DEPLOY
 
 # ============================================================================
 # OAUTH PROXY FOR BLACKBOARD
