@@ -1,10 +1,12 @@
 """
-Blackboard MCP Server - Step 1: Test OAuth Setup
+Blackboard MCP Server - Cloud Version
+Fixed OAuth parameter names
 """
 
 import os
 from fastmcp import FastMCP
 from fastmcp.server.auth import OAuthProxy
+from fastmcp.server.auth.providers.jwt import JWTVerifier
 
 # ============================================================================
 # CONFIGURATION
@@ -16,18 +18,50 @@ BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET", "")
 BASE_URL = os.environ.get("BASE_URL", "https://blackboard-mcp.fastmcp.app")
 
 # ============================================================================
-# OAUTH PROXY
+# TOKEN VERIFIER
+# Blackboard uses opaque tokens, so we'll create a simple pass-through verifier
+# ============================================================================
+
+class BlackboardTokenVerifier:
+    """Simple token verifier for Blackboard opaque tokens"""
+    
+    required_scopes = ["read", "write"]
+    
+    async def verify(self, token: str) -> dict:
+        # Blackboard tokens are opaque - we trust them if received from OAuth flow
+        # In production, you might want to call Blackboard's token info endpoint
+        return {
+            "active": True,
+            "scope": "read write",
+            "token": token
+        }
+
+# ============================================================================
+# OAUTH PROXY - Using correct parameter names!
 # ============================================================================
 
 auth = OAuthProxy(
-    client_id=BLACKBOARD_APP_KEY,
-    client_secret=BLACKBOARD_APP_SECRET,
+    # Upstream OAuth endpoints (Blackboard)
+    upstream_authorization_endpoint=f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode",
+    upstream_token_endpoint=f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/token",
+    
+    # Your registered app credentials
+    upstream_client_id=BLACKBOARD_APP_KEY,
+    upstream_client_secret=BLACKBOARD_APP_SECRET,
+    
+    # Token verifier
+    token_verifier=BlackboardTokenVerifier(),
+    
+    # Your FastMCP server's public URL
     base_url=BASE_URL,
-    authorize_endpoint=f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode",
-    token_endpoint=f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/token",
-    redirect_path="/oauth/callback",
-    required_scopes=["read", "write"],
+    
+    # Callback path (default is /auth/callback)
+    redirect_path="/auth/callback",
+    
+    # Blackboard uses client_secret_basic (Base64 in Authorization header)
     token_endpoint_auth_method="client_secret_basic",
+    
+    # Blackboard likely doesn't support PKCE
     forward_pkce=False,
 )
 
