@@ -23,29 +23,7 @@ SERVER_URL = os.environ.get("SERVER_URL", "https://blackboard-mcp.fastmcp.app")
 # ============================================================================
 # MCP SERVER
 # ============================================================================
-from fastmcp.server.auth.auth import OAuthProvider
-
-# Simple OAuth provider that tells Claude where to authenticate
-class BlackboardOAuthMetadata(OAuthProvider):
-    def __init__(self):
-        from mcp.server.auth.settings import ClientRegistrationOptions
-        super().__init__(
-            client_registration_options=ClientRegistrationOptions(
-                enabled=True,
-                valid_scopes=["read", "write", "offline"],
-                default_scopes=["read", "write", "offline"],
-            ),
-            required_scopes=["read", "write"],
-        )
-    
-    def get_authorization_endpoint(self) -> str:
-        return f"{SERVER_URL}/oauth/authorize"
-    
-    def get_token_endpoint(self) -> str:
-        return f"{SERVER_URL}/oauth/token"
-
-# Create server with OAuth
-mcp = FastMCP("Blackboard", auth=BlackboardOAuthMetadata())
+mcp = FastMCP("Blackboard")
 
 # Store pending OAuth flows and tokens in memory
 _pending_auths = {}
