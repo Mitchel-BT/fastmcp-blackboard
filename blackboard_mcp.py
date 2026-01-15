@@ -24,8 +24,8 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL", "https://anthropic.bt-retool.shop")
 BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY", "a743ef51-d7bc-4a7e-97e6-bae6f086a0d4")
 BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET", "2DXuZHi9QFZgKfIAkt8JJKhVWDBRdT0q")
-# BASE_URL should be YOUR MCP server URL, not the Blackboard URL
-BASE_URL = os.environ.get("BASE_URL", "https://blackboard-mcp.fastmcp.app")
+# MCP_BASE_URL should be YOUR MCP server URL, not the Blackboard URL
+MCP_BASE_URL = os.environ.get("MCP_BASE_URL", "https://blackboard-mcp.fastmcp.app")
 
 # ============================================================================
 # CUSTOM BLACKBOARD OAUTH PROVIDER
@@ -38,25 +38,22 @@ class BlackboardOAuthProvider(OAuthProvider):
         blackboard_url: str,
         client_id: str,
         client_secret: str,
-        callback_url: str,
+        mcp_base_url: str,
+        redirect_path: str = "/auth/callback",
     ):
         self.blackboard_url = blackboard_url.rstrip('/')
         self.upstream_client_id = client_id
         self.upstream_client_secret = client_secret
-        self.oauth_callback_url = callback_url
+        self.mcp_base_url = mcp_base_url.rstrip('/')
+        self.redirect_path = redirect_path
         
         # Storage for auth codes and tokens
         self._pending_auth: dict[str, dict] = {}
         self._auth_codes: dict[str, dict] = {}
         self._clients: dict[str, OAuthClientInformationFull] = {}
         
-        # Extract base URL from callback URL for the OAuth provider
-        from urllib.parse import urlparse
-        parsed = urlparse(callback_url)
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
-        
+        # Initialize parent without any extra arguments
         super().__init__(
-            base_url=base_url,
             client_registration_options=ClientRegistrationOptions(
                 enabled=True,
                 valid_scopes=["read", "write", "offline"],
@@ -75,7 +72,7 @@ class BlackboardOAuthProvider(OAuthProvider):
     
     @property
     def callback_url(self) -> str:
-        return self.oauth_callback_url
+        return f"{self.mcp_base_url}{self.redirect_path}"
     
     async def register_client(self, client_info: OAuthClientInformationFull) -> OAuthClientInformationFull:
         """Register a new OAuth client (DCR)"""
@@ -137,10 +134,6 @@ class BlackboardOAuthProvider(OAuthProvider):
         del self._pending_auth[state]
         
         # Exchange code with Blackboard using their specific format
-        # Blackboard wants: POST /token?code=XXX&redirect_uri=YYY
-        # with body: grant_type=authorization_code
-        # and Basic auth header
-        
         token_url = f"{self.token_endpoint}?code={code}&redirect_uri={self.callback_url}"
         
         # Create Basic auth header
@@ -256,7 +249,7 @@ auth_provider = BlackboardOAuthProvider(
     blackboard_url=BLACKBOARD_URL,
     client_id=BLACKBOARD_APP_KEY,
     client_secret=BLACKBOARD_APP_SECRET,
-    base_url=BASE_URL,
+    mcp_base_url=MCP_BASE_URL,
     redirect_path="/auth/callback",
 )
 
@@ -314,6 +307,6 @@ def check_config() -> str:
     return (
         f"BLACKBOARD_URL: {BLACKBOARD_URL}\n"
         f"APP_KEY: {BLACKBOARD_APP_KEY[:8]}...\n"
-        f"BASE_URL: {BASE_URL}\n"
-        f"Callback URL: {BASE_URL}/auth/callback\n"
+        f"MCP_BASE_URL: {MCP_BASE_URL}\n"
+        f"Callback URL: {MCP_BASE_URL}/auth/callback\n"
     )
