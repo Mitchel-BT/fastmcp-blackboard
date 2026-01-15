@@ -24,7 +24,8 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL", "https://anthropic.bt-retool.shop")
 BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY", "a743ef51-d7bc-4a7e-97e6-bae6f086a0d4")
 BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET", "2DXuZHi9QFZgKfIAkt8JJKhVWDBRdT0q")
-BASE_URL = os.environ.get("BASE_URL", "https://anthropic.bt-retool.shop")
+# BASE_URL should be YOUR MCP server URL, not the Blackboard URL
+BASE_URL = os.environ.get("BASE_URL", "https://blackboard-mcp.fastmcp.app")
 
 # ============================================================================
 # CUSTOM BLACKBOARD OAUTH PROVIDER
@@ -37,19 +38,22 @@ class BlackboardOAuthProvider(OAuthProvider):
         blackboard_url: str,
         client_id: str,
         client_secret: str,
-        base_url: str,
-        redirect_path: str = "/auth/callback",
+        callback_url: str,
     ):
         self.blackboard_url = blackboard_url.rstrip('/')
         self.upstream_client_id = client_id
         self.upstream_client_secret = client_secret
-        self.base_url = base_url.rstrip('/')
-        self.redirect_path = redirect_path
+        self.oauth_callback_url = callback_url
         
         # Storage for auth codes and tokens
         self._pending_auth: dict[str, dict] = {}
         self._auth_codes: dict[str, dict] = {}
         self._clients: dict[str, OAuthClientInformationFull] = {}
+        
+        # Extract base URL from callback URL for the OAuth provider
+        from urllib.parse import urlparse
+        parsed = urlparse(callback_url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
         
         super().__init__(
             base_url=base_url,
@@ -71,7 +75,7 @@ class BlackboardOAuthProvider(OAuthProvider):
     
     @property
     def callback_url(self) -> str:
-        return f"{self.base_url}{self.redirect_path}"
+        return self.oauth_callback_url
     
     async def register_client(self, client_info: OAuthClientInformationFull) -> OAuthClientInformationFull:
         """Register a new OAuth client (DCR)"""
@@ -92,7 +96,6 @@ class BlackboardOAuthProvider(OAuthProvider):
         our_state = secrets.token_urlsafe(32)
         
         # Store the original params for later
-        # Use getattr for optional PKCE fields that may not exist
         self._pending_auth[our_state] = {
             "client_id": client.client_id,
             "redirect_uri": str(params.redirect_uri),
@@ -115,7 +118,10 @@ class BlackboardOAuthProvider(OAuthProvider):
             "state": our_state,
         }
         
-        return f"{self.authorization_endpoint}?{urlencode(bb_params)}"
+        auth_url = f"{self.authorization_endpoint}?{urlencode(bb_params)}"
+        print(f"[OAuth] Generated authorization URL: {auth_url}")
+        print(f"[OAuth] Callback URL: {self.callback_url}")
+        return auth_url
     
     async def handle_blackboard_callback(self, code: str, state: str) -> tuple[str, str, str]:
         """
@@ -141,6 +147,9 @@ class BlackboardOAuthProvider(OAuthProvider):
         credentials = f"{self.upstream_client_id}:{self.upstream_client_secret}"
         auth_header = base64.b64encode(credentials.encode()).decode()
         
+        print(f"[OAuth] Exchanging code with Blackboard")
+        print(f"[OAuth] Token URL: {token_url}")
+        
         async with httpx.AsyncClient() as http_client:
             response = await http_client.post(
                 token_url,
@@ -152,9 +161,11 @@ class BlackboardOAuthProvider(OAuthProvider):
             )
             
             if response.status_code != 200:
+                print(f"[OAuth ERROR] Token exchange failed: {response.status_code} - {response.text}")
                 raise ValueError(f"Token exchange failed: {response.status_code} - {response.text}")
             
             token_data = response.json()
+            print(f"[OAuth] Successfully obtained tokens from Blackboard")
         
         # Generate a new internal code for the MCP client
         new_code = secrets.token_urlsafe(32)
@@ -265,10 +276,14 @@ async def oauth_callback(request):
     state = request.query_params.get("state")
     error = request.query_params.get("error")
     
+    print(f"[Callback] Received callback - code: {'present' if code else 'missing'}, state: {state[:8] if state else 'missing'}...")
+    
     if error:
+        print(f"[Callback ERROR] {error}: {request.query_params.get('error_description')}")
         return JSONResponse({"error": error, "description": request.query_params.get("error_description")})
     
     if not code or not state:
+        print(f"[Callback ERROR] Missing code or state")
         return JSONResponse({"error": "Missing code or state"})
     
     try:
@@ -280,8 +295,10 @@ async def oauth_callback(request):
             redirect_params["state"] = original_state
         
         final_url = f"{redirect_uri}?{urlencode(redirect_params)}"
+        print(f"[Callback] Redirecting to: {final_url[:50]}...")
         return RedirectResponse(final_url)
     except Exception as e:
+        print(f"[Callback ERROR] {str(e)}")
         return JSONResponse({"error": "callback_failed", "description": str(e)})
 
 
@@ -295,7 +312,8 @@ def hello(name: str = "World") -> str:
 def check_config() -> str:
     """Check that environment variables are loaded"""
     return (
-        f"BLACKBOARD_URL: {BLACKBOARD_URL[:30]}...\n"
+        f"BLACKBOARD_URL: {BLACKBOARD_URL}\n"
         f"APP_KEY: {BLACKBOARD_APP_KEY[:8]}...\n"
         f"BASE_URL: {BASE_URL}\n"
+        f"Callback URL: {BASE_URL}/auth/callback\n"
     )
