@@ -41,28 +41,15 @@ class BlackboardTokenVerifier:
 # ============================================================================
 
 auth = OAuthProxy(
-    # Upstream OAuth endpoints (Blackboard)
     upstream_authorization_endpoint=f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode",
     upstream_token_endpoint=f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/token",
-    
-    # Your registered app credentials
     upstream_client_id=BLACKBOARD_APP_KEY,
     upstream_client_secret=BLACKBOARD_APP_SECRET,
-    
-    # Token verifier
     token_verifier=BlackboardTokenVerifier(),
-    
-    # Your FastMCP server's public URL
     base_url=BASE_URL,
-    
-    # Callback path
     redirect_path="/auth/callback",
-    
-    # Try "none" or remove this line entirely
-    token_endpoint_auth_method="none",
-    
-    # Blackboard supports PKCE with S256
-    forward_pkce=True,
+    token_endpoint_auth_method="client_secret_basic",  # Back to basic
+    forward_pkce=False,  # Disable PKCE - Blackboard 3LO may not use it the same way
 )
 
 # ============================================================================
