@@ -7,9 +7,10 @@ import base64
 import secrets
 import time
 import httpx
-from urllib.parse import urlencode, parse_qs
+from urllib.parse import urlencode
 from fastmcp import FastMCP
-from starlette.responses import RedirectResponse, JSONResponse, HTMLResponse
+from starlette.responses import RedirectResponse, JSONResponse
+from starlette.requests import Request
 
 # ============================================================================
 # CONFIGURATION
@@ -20,7 +21,7 @@ BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET", "2DXuZHi9QFZgKfI
 SERVER_URL = os.environ.get("SERVER_URL", "https://blackboard-mcp.fastmcp.app")
 
 # ============================================================================
-# MCP SERVER (NO AUTH - We'll handle it manually)
+# MCP SERVER
 # ============================================================================
 mcp = FastMCP("Blackboard")
 
@@ -35,36 +36,31 @@ _tokens = {}
 
 @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
 async def oauth_config(request):
-    """OAuth server configuration - directs clients to our authorize endpoint"""
+    """OAuth server configuration"""
     return JSONResponse({
         "issuer": SERVER_URL,
         "authorization_endpoint": f"{SERVER_URL}/oauth/authorize",
         "token_endpoint": f"{SERVER_URL}/oauth/token",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
     })
 
 
 @mcp.custom_route("/oauth/authorize", methods=["GET"])
 async def oauth_authorize(request):
-    """
-    OAuth authorization endpoint - redirects to Blackboard for actual auth
-    This is called by Claude when it wants to authenticate
-    """
-    # Get OAuth params from Claude
+    """OAuth authorization endpoint - redirects to Blackboard"""
     client_id = request.query_params.get("client_id")
     redirect_uri = request.query_params.get("redirect_uri")
     state = request.query_params.get("state")
     code_challenge = request.query_params.get("code_challenge")
     
-    print(f"[OAuth] Authorization request from Claude")
-    print(f"[OAuth] Client redirect_uri: {redirect_uri}")
-    print(f"[OAuth] State: {state}")
+    print(f"[OAuth] Authorization request")
+    print(f"[OAuth] Redirect URI: {redirect_uri}")
     
-    # Generate our own state to track this flow
+    # Generate state to track this flow
     our_state = secrets.token_urlsafe(32)
     
-    # Store the original OAuth params
     _pending_auths[our_state] = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -73,7 +69,7 @@ async def oauth_authorize(request):
         "timestamp": time.time()
     }
     
-    # Build Blackboard authorization URL
+    # Redirect to Blackboard
     blackboard_auth_url = (
         f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode"
         f"?redirect_uri={SERVER_URL}/oauth/callback"
@@ -83,25 +79,18 @@ async def oauth_authorize(request):
         f"&state={our_state}"
     )
     
-    print(f"[OAuth] Redirecting to Blackboard: {blackboard_auth_url[:80]}...")
-    
-    # Redirect user to Blackboard for authentication
+    print(f"[OAuth] Redirecting to: {blackboard_auth_url[:80]}...")
     return RedirectResponse(blackboard_auth_url)
 
 
 @mcp.custom_route("/oauth/callback", methods=["GET"])
 async def oauth_callback(request):
-    """
-    OAuth callback from Blackboard
-    Exchange the code for a token, then redirect back to Claude
-    """
+    """OAuth callback from Blackboard"""
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")
     
     print(f"[Callback] Received from Blackboard")
-    print(f"[Callback] Code: {'present' if code else 'missing'}")
-    print(f"[Callback] State: {state[:8]}..." if state else "missing")
     
     if error:
         return JSONResponse({"error": error}, status_code=400)
@@ -109,17 +98,15 @@ async def oauth_callback(request):
     if not code or not state:
         return JSONResponse({"error": "missing_parameters"}, status_code=400)
     
-    # Get the original OAuth flow
     original = _pending_auths.get(state)
     if not original:
         return JSONResponse({"error": "invalid_state"}, status_code=400)
     
-    # Remove from pending
     del _pending_auths[state]
     
     try:
-        # Exchange code with Blackboard for token
-        print(f"[Callback] Exchanging code with Blackboard...")
+        # Exchange with Blackboard
+        print(f"[Callback] Exchanging code...")
         
         credentials = f"{BLACKBOARD_APP_KEY}:{BLACKBOARD_APP_SECRET}"
         auth_header = base64.b64encode(credentials.encode()).decode()
@@ -139,16 +126,15 @@ async def oauth_callback(request):
             )
             
             if response.status_code != 200:
-                print(f"[Callback ERROR] Token exchange failed: {response.text}")
+                print(f"[Callback ERROR] {response.text}")
                 return JSONResponse({"error": "token_exchange_failed"}, status_code=500)
             
             token_data = response.json()
-            print(f"[Callback] Successfully got token from Blackboard")
+            print(f"[Callback] Got token from Blackboard")
         
-        # Generate a code to give back to Claude
+        # Generate code for Claude
         claude_code = secrets.token_urlsafe(32)
         
-        # Store the Blackboard token mapped to this code
         _tokens[claude_code] = {
             "access_token": token_data["access_token"],
             "token_type": token_data.get("token_type", "bearer"),
@@ -158,11 +144,9 @@ async def oauth_callback(request):
             "timestamp": time.time()
         }
         
-        # Redirect back to Claude with the code
-        claude_callback = original["redirect_uri"]
-        redirect_url = f"{claude_callback}?code={claude_code}&state={original['state']}"
-        
-        print(f"[Callback] Redirecting to Claude: {redirect_url[:60]}...")
+        # Redirect back to Claude
+        redirect_url = f"{original['redirect_uri']}?code={claude_code}&state={original['state']}"
+        print(f"[Callback] Redirecting to Claude")
         return RedirectResponse(redirect_url)
         
     except Exception as e:
@@ -172,30 +156,20 @@ async def oauth_callback(request):
 
 @mcp.custom_route("/oauth/token", methods=["POST"])
 async def oauth_token(request):
-    """
-    Token endpoint - Claude exchanges the code for an access token
-    """
+    """Token endpoint for Claude"""
     form = await request.form()
-    grant_type = form.get("grant_type")
     code = form.get("code")
     
-    print(f"[Token] Token exchange request")
-    print(f"[Token] Grant type: {grant_type}")
-    print(f"[Token] Code: {code[:8]}..." if code else "missing")
-    
-    if grant_type != "authorization_code":
-        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+    print(f"[Token] Exchange request")
     
     if not code:
         return JSONResponse({"error": "missing_code"}, status_code=400)
     
-    # Get the stored token
     token_data = _tokens.get(code)
     if not token_data:
         return JSONResponse({"error": "invalid_code"}, status_code=400)
     
-    # Return the token to Claude
-    print(f"[Token] Returning access token to Claude")
+    print(f"[Token] Returning token to Claude")
     
     return JSONResponse({
         "access_token": token_data["access_token"],
@@ -206,24 +180,57 @@ async def oauth_token(request):
 
 
 # ============================================================================
-# MCP TOOLS
+# MIDDLEWARE TO REQUIRE AUTH
+# ============================================================================
+
+@mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+async def protected_resource_config(request):
+    """Indicate that this resource requires OAuth"""
+    return JSONResponse({
+        "resource": SERVER_URL,
+        "authorization_servers": [SERVER_URL]
+    })
+
+
+# ============================================================================
+# MCP TOOLS (These will automatically require authentication)
 # ============================================================================
 
 @mcp.tool()
 async def get_my_courses() -> str:
-    """Get all courses the authenticated user has access to"""
-    # Note: The token will be in the MCP context after authentication
-    # For now, return a message
-    return "Authentication flow configured. Please authenticate through Claude."
+    """
+    Get all courses you have access to in Blackboard.
+    This will prompt for authentication if needed.
+    """
+    # Claude will automatically inject the access token
+    # For now, return instructions
+    return (
+        "To use this tool, Claude needs to authenticate with Blackboard first.\n"
+        "You should be prompted to log in. If not, try reconnecting the MCP server."
+    )
+
+
+@mcp.tool()
+async def get_course_assignments(course_id: str) -> str:
+    """
+    Get assignments for a specific course.
+    
+    Args:
+        course_id: The course ID from get_my_courses (e.g., "_123_1")
+    """
+    return f"Getting assignments for course {course_id}..."
 
 
 @mcp.tool()
 async def check_config() -> str:
-    """Check server configuration"""
+    """Check server configuration and OAuth endpoints"""
     return (
         f"Blackboard URL: {BLACKBOARD_URL}\n"
         f"App Key: {BLACKBOARD_APP_KEY[:8]}...\n"
         f"Server URL: {SERVER_URL}\n"
-        f"Authorization endpoint: {SERVER_URL}/oauth/authorize\n"
-        f"Callback URL: {SERVER_URL}/oauth/callback\n"
+        f"\nOAuth Endpoints:\n"
+        f"- Discovery: {SERVER_URL}/.well-known/oauth-authorization-server\n"
+        f"- Authorize: {SERVER_URL}/oauth/authorize\n"
+        f"- Token: {SERVER_URL}/oauth/token\n"
+        f"- Callback: {SERVER_URL}/oauth/callback\n"
     )
