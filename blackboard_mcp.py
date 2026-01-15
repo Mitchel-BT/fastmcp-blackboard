@@ -55,14 +55,14 @@ auth = OAuthProxy(
     # Your FastMCP server's public URL
     base_url=BASE_URL,
     
-    # Callback path (default is /auth/callback)
+    # Callback path
     redirect_path="/auth/callback",
     
-    # Blackboard uses client_secret_basic (Base64 in Authorization header)
-    token_endpoint_auth_method="client_secret_basic",
+    # Try "none" or remove this line entirely
+    token_endpoint_auth_method="none",
     
-    # Blackboard likely doesn't support PKCE
-    forward_pkce=False,
+    # Blackboard supports PKCE with S256
+    forward_pkce=True,
 )
 
 # ============================================================================
