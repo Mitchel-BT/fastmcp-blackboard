@@ -63,6 +63,7 @@ auth = OAuthProxy(
     
     # Blackboard supports PKCE with S256
     forward_pkce=True,
+    enable_dcr=False,
 )
 
 # ============================================================================
