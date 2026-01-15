@@ -92,11 +92,12 @@ class BlackboardOAuthProvider(OAuthProvider):
         our_state = secrets.token_urlsafe(32)
         
         # Store the original params for later
+        # Use getattr for optional PKCE fields that may not exist
         self._pending_auth[our_state] = {
             "client_id": client.client_id,
             "redirect_uri": str(params.redirect_uri),
-            "code_challenge": params.code_challenge,
-            "code_challenge_method": params.code_challenge_method,
+            "code_challenge": getattr(params, 'code_challenge', None),
+            "code_challenge_method": getattr(params, 'code_challenge_method', None),
             "scope": params.scope,
             "original_state": params.state,
         }
