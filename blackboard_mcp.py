@@ -73,6 +73,14 @@ class BlackboardOAuthProvider(OAuthProvider):
     def callback_url(self) -> str:
         return f"{self.base_url}{self.redirect_path}"
     
+    def get_authorization_endpoint(self) -> str:
+        """Override to return Blackboard's authorization endpoint"""
+        return self.authorization_endpoint
+    
+    def get_token_endpoint(self) -> str:
+        """Override to return Blackboard's token endpoint"""
+        return self.token_endpoint
+    
     async def register_client(self, client_info: OAuthClientInformationFull) -> OAuthClientInformationFull:
         """Register a new OAuth client (DCR)"""
         self._clients[client_info.client_id] = client_info
@@ -90,6 +98,10 @@ class BlackboardOAuthProvider(OAuthProvider):
         """Generate authorization URL for Blackboard"""
         # Generate our own state to track this auth flow
         our_state = secrets.token_urlsafe(32)
+        
+        print(f"[DEBUG] authorize() called")
+        print(f"[DEBUG] Client ID: {client.client_id}")
+        print(f"[DEBUG] Params redirect_uri: {params.redirect_uri}")
         
         # Store the original params for later
         # Use getattr for optional PKCE fields that may not exist
@@ -115,7 +127,10 @@ class BlackboardOAuthProvider(OAuthProvider):
             "state": our_state,
         }
         
-        return f"{self.authorization_endpoint}?{urlencode(bb_params)}"
+        auth_url = f"{self.authorization_endpoint}?{urlencode(bb_params)}"
+        print(f"[DEBUG] Generated Blackboard auth URL: {auth_url}")
+        
+        return auth_url
     
     async def handle_blackboard_callback(self, code: str, state: str) -> tuple[str, str, str]:
         """
