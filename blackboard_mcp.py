@@ -23,7 +23,29 @@ SERVER_URL = os.environ.get("SERVER_URL", "https://blackboard-mcp.fastmcp.app")
 # ============================================================================
 # MCP SERVER
 # ============================================================================
-mcp = FastMCP("Blackboard")
+from fastmcp.server.auth.auth import OAuthProvider
+
+# Simple OAuth provider that tells Claude where to authenticate
+class BlackboardOAuthMetadata(OAuthProvider):
+    def __init__(self):
+        from mcp.server.auth.settings import ClientRegistrationOptions
+        super().__init__(
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True,
+                valid_scopes=["read", "write", "offline"],
+                default_scopes=["read", "write", "offline"],
+            ),
+            required_scopes=["read", "write"],
+        )
+    
+    def get_authorization_endpoint(self) -> str:
+        return f"{SERVER_URL}/oauth/authorize"
+    
+    def get_token_endpoint(self) -> str:
+        return f"{SERVER_URL}/oauth/token"
+
+# Create server with OAuth
+mcp = FastMCP("Blackboard", auth=BlackboardOAuthMetadata())
 
 # Store pending OAuth flows and tokens in memory
 _pending_auths = {}
@@ -203,39 +225,46 @@ async def protected_resource_config(request):
 # MCP TOOLS
 # ============================================================================
 
+# ============================================================================
+# MCP TOOLS
+# ============================================================================
+
+def check_authentication():
+    """Check if we have a valid token, raise error if not"""
+    if not _tokens:
+        raise Exception("Authentication required. Please log in to Blackboard.")
+    
+    # Find a valid token
+    for value in _tokens.values():
+        if value.get("exchanged") and "access_token" in value:
+            return value["access_token"]
+    
+    # Fallback
+    for value in _tokens.values():
+        if "access_token" in value and len(value["access_token"]) > 20:
+            return value["access_token"]
+    
+    raise Exception("No valid authentication token found. Please reconnect.")
+
+
 @mcp.tool()
 async def get_my_courses() -> str:
     """
     Get all courses you have access to in Blackboard.
+    Requires authentication.
     """
-    # Check if we have any stored tokens
-    if not _tokens:
-        return "Error: Not authenticated. Please reconnect the MCP server to trigger authentication."
+    try:
+        token = check_authentication()
+    except Exception as e:
+        return f"Error: {str(e)}\n\nPlease authenticate by visiting:\n{SERVER_URL}/oauth/authorize?client_id=claude&redirect_uri=http://localhost:49088/oauth/callback&response_type=code&state=auth&scope=read%20write%20offline"
     
-    # Find a valid access token (not a code)
-    valid_token = None
-    for key, value in _tokens.items():
-        if value.get("exchanged"):  # This is a real token that's been exchanged
-            valid_token = value["access_token"]
-            break
-    
-    if not valid_token:
-        # Fallback: try to find any access token
-        for value in _tokens.values():
-            if "access_token" in value and len(value["access_token"]) > 20:
-                valid_token = value["access_token"]
-                break
-    
-    if not valid_token:
-        return f"Error: No valid token found. Tokens in storage: {len(_tokens)}"
-    
-    print(f"[Tool] get_my_courses - using token: {valid_token[:10]}...")
+    print(f"[Tool] get_my_courses - using token: {token[:10]}...")
     
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
                 f"{BLACKBOARD_URL}/learn/api/public/v1/courses?limit=100",
-                headers={"Authorization": f"Bearer {valid_token}"},
+                headers={"Authorization": f"Bearer {token}"},
                 timeout=30.0
             )
             
