@@ -12,10 +12,10 @@ from fastmcp.server.auth.providers.jwt import JWTVerifier
 # CONFIGURATION
 # ============================================================================
 
-BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL", "").rstrip('/')
+BLACKBOARD_URL = "https://anthropic.bt-retool.shop"
 BLACKBOARD_APP_KEY = "a743ef51-d7bc-4a7e-97e6-bae6f086a0d4"
-BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET", "")
-BASE_URL = os.environ.get("BASE_URL", "https://blackboard-mcp.fastmcp.app")
+BLACKBOARD_APP_SECRET = "2DXuZHi9QFZgKfIAkt8JJKhVWDBRdT0q"
+BASE_URL = "https://blackboard-mcp.fastmcp.app"
 
 # ============================================================================
 # TOKEN VERIFIER
@@ -63,7 +63,6 @@ auth = OAuthProxy(
     
     # Blackboard supports PKCE with S256
     forward_pkce=True,
-    enable_dcr=False,
 )
 
 # ============================================================================
