@@ -1,65 +1,272 @@
 """
-Blackboard MCP Server - Cloud Version
-Fixed OAuth parameter names
+Blackboard MCP Server - Custom OAuth Provider
+Handles Blackboard's non-standard token endpoint format
 """
-
 import os
+import base64
+import secrets
+import time
+import httpx
+from urllib.parse import urlencode
 from fastmcp import FastMCP
-from fastmcp.server.auth import OAuthProxy
-from fastmcp.server.auth.providers.jwt import JWTVerifier
+from fastmcp.server.auth import OAuthProvider, ClientRegistrationOptions
+from mcp.server.auth.provider import (
+    AuthorizationCode,
+    AuthorizationParams,
+    RefreshToken,
+    construct_redirect_uri,
+)
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from pydantic import AnyHttpUrl
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-
-BLACKBOARD_URL = "https://anthropic.bt-retool.shop"
-BLACKBOARD_APP_KEY = "a743ef51-d7bc-4a7e-97e6-bae6f086a0d4"
-BLACKBOARD_APP_SECRET = "2DXuZHi9QFZgKfIAkt8JJKhVWDBRdT0q"
-BASE_URL = "https://blackboard-mcp.fastmcp.app"
+BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL", "https://anthropic.bt-retool.shop")
+BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY", "a743ef51-d7bc-4a7e-97e6-bae6f086a0d4")
+BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET", "2DXuZHi9QFZgKfIAkt8JJKhVWDBRdT0q")
+BASE_URL = os.environ.get("BASE_URL", "https://blackboard-mcp.fastmcp.app")
 
 # ============================================================================
-# TOKEN VERIFIER
-# Blackboard uses opaque tokens, so we'll create a simple pass-through verifier
+# CUSTOM BLACKBOARD OAUTH PROVIDER
 # ============================================================================
-
-class BlackboardTokenVerifier:
-    """Simple token verifier for Blackboard opaque tokens"""
+class BlackboardOAuthProvider(OAuthProvider):
+    """Custom OAuth provider for Blackboard's non-standard OAuth implementation"""
     
-    required_scopes = ["read", "write"]
+    def __init__(
+        self,
+        blackboard_url: str,
+        client_id: str,
+        client_secret: str,
+        base_url: str,
+        redirect_path: str = "/auth/callback",
+    ):
+        self.blackboard_url = blackboard_url.rstrip('/')
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.base_url = base_url.rstrip('/')
+        self.redirect_path = redirect_path
+        
+        # Storage for auth codes and tokens
+        self._auth_codes: dict[str, dict] = {}
+        self._clients: dict[str, OAuthClientInformationFull] = {}
+        self._tokens: dict[str, dict] = {}
+        
+        super().__init__(
+            issuer_url=base_url,
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True,
+                valid_scopes=["read", "write", "offline"],
+                default_scopes=["read", "write"],
+            ),
+            required_scopes=["read"],
+        )
     
-    async def verify(self, token: str) -> dict:
-        # Blackboard tokens are opaque - we trust them if received from OAuth flow
+    @property
+    def authorization_endpoint(self) -> str:
+        return f"{self.blackboard_url}/learn/api/public/v1/oauth2/authorizationcode"
+    
+    @property
+    def token_endpoint(self) -> str:
+        return f"{self.blackboard_url}/learn/api/public/v1/oauth2/token"
+    
+    @property
+    def callback_url(self) -> str:
+        return f"{self.base_url}{self.redirect_path}"
+    
+    async def register_client(self, client_info: OAuthClientInformationFull) -> OAuthClientInformationFull:
+        """Register a new OAuth client (DCR)"""
+        # Store client and return it with our upstream credentials
+        self._clients[client_info.client_id] = client_info
+        return client_info
+    
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        """Get registered client info"""
+        return self._clients.get(client_id)
+    
+    async def authorize(
+        self,
+        client: OAuthClientInformationFull,
+        params: AuthorizationParams,
+    ) -> str:
+        """Generate authorization URL for Blackboard"""
+        # Store the original params for later
+        state = params.state or secrets.token_urlsafe(32)
+        
+        # Store mapping of state to client redirect
+        self._auth_codes[state] = {
+            "client_id": client.client_id,
+            "redirect_uri": str(params.redirect_uri),
+            "code_challenge": params.code_challenge,
+            "code_challenge_method": params.code_challenge_method,
+            "scope": params.scope,
+            "original_state": params.state,
+        }
+        
+        # Build Blackboard authorization URL
+        bb_params = {
+            "response_type": "code",
+            "client_id": self.client_id,
+            "redirect_uri": self.callback_url,
+            "scope": params.scope or "read write",
+            "state": state,
+        }
+        
+        return f"{self.authorization_endpoint}?{urlencode(bb_params)}"
+    
+    async def handle_callback(self, code: str, state: str) -> tuple[str, str]:
+        """
+        Handle the OAuth callback from Blackboard.
+        Exchange the code for tokens using Blackboard's specific format.
+        Returns (new_code, original_redirect_uri)
+        """
+        stored = self._auth_codes.get(state)
+        if not stored:
+            raise ValueError(f"Invalid state: {state}")
+        
+        # Exchange code with Blackboard using their specific format
+        # Blackboard wants: POST /token?code=XXX&redirect_uri=YYY
+        # with body: grant_type=authorization_code
+        # and Basic auth header
+        
+        token_url = f"{self.token_endpoint}?code={code}&redirect_uri={self.callback_url}"
+        
+        # Create Basic auth header
+        credentials = f"{self.client_id}:{self.client_secret}"
+        auth_header = base64.b64encode(credentials.encode()).decode()
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                token_url,
+                data="grant_type=authorization_code",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Authorization": f"Basic {auth_header}",
+                },
+            )
+            
+            if response.status_code != 200:
+                raise ValueError(f"Token exchange failed: {response.status_code} - {response.text}")
+            
+            token_data = response.json()
+        
+        # Store the upstream tokens
+        new_code = secrets.token_urlsafe(32)
+        self._tokens[new_code] = {
+            "access_token": token_data.get("access_token"),
+            "token_type": token_data.get("token_type", "bearer"),
+            "expires_in": token_data.get("expires_in", 3600),
+            "refresh_token": token_data.get("refresh_token"),
+            "scope": token_data.get("scope", "read write"),
+            "client_id": stored["client_id"],
+            "created_at": time.time(),
+        }
+        
+        return new_code, stored["redirect_uri"]
+    
+    async def exchange_authorization_code(
+        self,
+        client: OAuthClientInformationFull,
+        authorization_code: AuthorizationCode,
+    ) -> OAuthToken:
+        """Exchange our internal auth code for tokens"""
+        code = authorization_code.code
+        token_data = self._tokens.get(code)
+        
+        if not token_data:
+            raise ValueError("Invalid authorization code")
+        
+        # Remove the code (one-time use)
+        del self._tokens[code]
+        
+        return OAuthToken(
+            access_token=token_data["access_token"],
+            token_type=token_data["token_type"],
+            expires_in=token_data["expires_in"],
+            refresh_token=token_data.get("refresh_token"),
+            scope=token_data["scope"],
+        )
+    
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+    ) -> OAuthToken:
+        """Exchange refresh token for new access token"""
+        # Blackboard refresh token format
+        token_url = f"{self.token_endpoint}?refresh_token={refresh_token.token}&redirect_uri={self.callback_url}"
+        
+        credentials = f"{self.client_id}:{self.client_secret}"
+        auth_header = base64.b64encode(credentials.encode()).decode()
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                token_url,
+                data="grant_type=refresh_token",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Authorization": f"Basic {auth_header}",
+                },
+            )
+            
+            if response.status_code != 200:
+                raise ValueError(f"Refresh failed: {response.status_code}")
+            
+            token_data = response.json()
+        
+        return OAuthToken(
+            access_token=token_data.get("access_token"),
+            token_type=token_data.get("token_type", "bearer"),
+            expires_in=token_data.get("expires_in", 3600),
+            refresh_token=token_data.get("refresh_token"),
+            scope=token_data.get("scope", "read write"),
+        )
+    
+    async def verify_access_token(self, token: str) -> dict | None:
+        """Verify an access token - Blackboard uses opaque tokens"""
+        # For Blackboard opaque tokens, we trust them if we issued them
         # In production, you might want to call Blackboard's token info endpoint
         return {
             "active": True,
             "scope": "read write",
-            "token": token
+            "token": token,
         }
 
-# ============================================================================
-# OAUTH PROXY - Using correct parameter names!
-# ============================================================================
-
-auth = OAuthProxy(
-    upstream_authorization_endpoint=f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode",
-    upstream_token_endpoint=f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/token",
-    upstream_client_id=BLACKBOARD_APP_KEY,
-    upstream_client_secret=BLACKBOARD_APP_SECRET,
-    token_verifier=BlackboardTokenVerifier(),
-    base_url=BASE_URL,
-    redirect_path="/auth/callback",
-    token_endpoint_auth_method="client_secret_basic",  # Back to basic
-    forward_pkce=False,  # Disable PKCE - Blackboard 3LO may not use it the same way
-)
 
 # ============================================================================
 # MCP SERVER
 # ============================================================================
+auth = BlackboardOAuthProvider(
+    blackboard_url=BLACKBOARD_URL,
+    client_id=BLACKBOARD_APP_KEY,
+    client_secret=BLACKBOARD_APP_SECRET,
+    base_url=BASE_URL,
+    redirect_path="/auth/callback",
+)
 
 mcp = FastMCP(
     name="Blackboard",
     auth=auth,
 )
+
+# Custom callback route to handle Blackboard's OAuth callback
+@mcp.custom_route("/auth/callback", methods=["GET"])
+async def oauth_callback(request):
+    """Handle OAuth callback from Blackboard"""
+    from starlette.responses import RedirectResponse
+    
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    
+    if not code or not state:
+        return {"error": "Missing code or state"}
+    
+    try:
+        new_code, redirect_uri = await auth.handle_callback(code, state)
+        # Redirect back to the MCP client with our internal code
+        return RedirectResponse(f"{redirect_uri}?code={new_code}&state={state}")
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @mcp.tool()
