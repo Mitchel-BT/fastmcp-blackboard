@@ -13,7 +13,7 @@ from fastmcp.server.auth.providers.jwt import JWTVerifier
 # ============================================================================
 
 BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL", "").rstrip('/')
-BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY", "")
+BLACKBOARD_APP_KEY = "a743ef51-d7bc-4a7e-97e6-bae6f086a0d4"
 BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET", "")
 BASE_URL = os.environ.get("BASE_URL", "https://blackboard-mcp.fastmcp.app")
 
