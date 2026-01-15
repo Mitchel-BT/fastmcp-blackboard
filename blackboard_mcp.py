@@ -169,7 +169,14 @@ async def oauth_token(request):
     if not token_data:
         return JSONResponse({"error": "invalid_code"}, status_code=400)
     
-    print(f"[Token] Returning token to Claude")
+    # Don't delete the token - keep it for tool calls
+    # Just mark it as used
+    token_data["exchanged"] = True
+    
+    # Also store by access token for easy lookup
+    _tokens[token_data["access_token"]] = token_data
+    
+    print(f"[Token] Returning token to Claude: {token_data['access_token'][:10]}...")
     
     return JSONResponse({
         "access_token": token_data["access_token"],
@@ -193,21 +200,64 @@ async def protected_resource_config(request):
 
 
 # ============================================================================
-# MCP TOOLS (These will automatically require authentication)
+# MCP TOOLS
 # ============================================================================
 
 @mcp.tool()
 async def get_my_courses() -> str:
     """
     Get all courses you have access to in Blackboard.
-    This will prompt for authentication if needed.
     """
-    # Claude will automatically inject the access token
-    # For now, return instructions
-    return (
-        "To use this tool, Claude needs to authenticate with Blackboard first.\n"
-        "You should be prompted to log in. If not, try reconnecting the MCP server."
-    )
+    # Check if we have any stored tokens
+    if not _tokens:
+        return "Error: Not authenticated. Please reconnect the MCP server to trigger authentication."
+    
+    # Find a valid access token (not a code)
+    valid_token = None
+    for key, value in _tokens.items():
+        if value.get("exchanged"):  # This is a real token that's been exchanged
+            valid_token = value["access_token"]
+            break
+    
+    if not valid_token:
+        # Fallback: try to find any access token
+        for value in _tokens.values():
+            if "access_token" in value and len(value["access_token"]) > 20:
+                valid_token = value["access_token"]
+                break
+    
+    if not valid_token:
+        return f"Error: No valid token found. Tokens in storage: {len(_tokens)}"
+    
+    print(f"[Tool] get_my_courses - using token: {valid_token[:10]}...")
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{BLACKBOARD_URL}/learn/api/public/v1/courses?limit=100",
+                headers={"Authorization": f"Bearer {valid_token}"},
+                timeout=30.0
+            )
+            
+            print(f"[Tool] Blackboard API response: {response.status_code}")
+            
+            if response.status_code != 200:
+                return f"Error: {response.status_code} - {response.text}"
+            
+            data = response.json()
+            courses = data.get("results", [])
+            
+            if not courses:
+                return "No courses found"
+            
+            result = f"Found {len(courses)} courses:\n\n"
+            for course in courses:
+                result += f"- {course.get('name', 'Unnamed')} (ID: {course.get('id')})\n"
+            
+            return result
+    except Exception as e:
+        print(f"[Tool ERROR] {str(e)}")
+        return f"Error calling Blackboard API: {str(e)}"
 
 
 @mcp.tool()
@@ -218,7 +268,52 @@ async def get_course_assignments(course_id: str) -> str:
     Args:
         course_id: The course ID from get_my_courses (e.g., "_123_1")
     """
-    return f"Getting assignments for course {course_id}..."
+    if not _tokens:
+        return "Error: Not authenticated."
+    
+    latest_token = list(_tokens.values())[-1]
+    token = latest_token["access_token"]
+    
+    print(f"[Tool] get_course_assignments for course: {course_id}")
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{BLACKBOARD_URL}/learn/api/public/v1/courses/{course_id}/gradebook/columns",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            
+            if response.status_code != 200:
+                return f"Error: {response.status_code} - {response.text}"
+            
+            data = response.json()
+            columns = data.get("results", [])
+            
+            # Filter to assignments with due dates  
+            assignments = [c for c in columns if c.get("grading", {}).get("due")]
+            
+            if not assignments:
+                return f"No assignments with due dates found in course {course_id}"
+            
+            result = f"Found {len(assignments)} assignments:\n\n"
+            for assignment in assignments:
+                name = assignment.get("name", "Unnamed")
+                points = assignment.get("score", {}).get("possible", "?")
+                due = assignment.get("grading", {}).get("due", "No due date")
+                result += f"- {name} ({points} points) - Due: {due}\n"
+            
+            return result
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def debug_tokens() -> str:
+    """Debug tool to see stored tokens"""
+    if not _tokens:
+        return "No tokens stored"
+    
+    return f"Found {len(_tokens)} token(s). Latest user: {list(_tokens.values())[-1].get('user_id', 'unknown')}"
 
 
 @mcp.tool()
