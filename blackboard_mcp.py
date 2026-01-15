@@ -24,7 +24,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL", "https://anthropic.bt-retool.shop")
 BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY", "a743ef51-d7bc-4a7e-97e6-bae6f086a0d4")
 BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET", "2DXuZHi9QFZgKfIAkt8JJKhVWDBRdT0q")
-BASE_URL = os.environ.get("BASE_URL", "https://blackboard-mcp.fastmcp.app")
+BASE_URL = os.environ.get("BASE_URL", "https://anthropic.bt-retool.shop")
 
 # ============================================================================
 # CUSTOM BLACKBOARD OAUTH PROVIDER
