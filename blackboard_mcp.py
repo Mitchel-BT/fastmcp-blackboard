@@ -52,7 +52,7 @@ class BlackboardOAuthProvider(OAuthProvider):
         self._clients: dict[str, OAuthClientInformationFull] = {}
         
         super().__init__(
-            issuer_url=base_url,
+            base_url=base_url,
             client_registration_options=ClientRegistrationOptions(
                 enabled=True,
                 valid_scopes=["read", "write", "offline"],
