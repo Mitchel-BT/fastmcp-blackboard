@@ -98,16 +98,20 @@ class BlackboardOAuthProvider(OAuthProvider):
             "redirect_uri": str(params.redirect_uri),
             "code_challenge": getattr(params, 'code_challenge', None),
             "code_challenge_method": getattr(params, 'code_challenge_method', None),
-            "scope": params.scope,
+            "scope": getattr(params, 'scopes', None) or getattr(params, 'scope', 'read write'),
             "original_state": params.state,
         }
         
         # Build Blackboard authorization URL
+        scope_str = getattr(params, 'scopes', None) or getattr(params, 'scope', 'read write')
+        if isinstance(scope_str, list):
+            scope_str = ' '.join(scope_str)
+        
         bb_params = {
             "response_type": "code",
             "client_id": self.upstream_client_id,
             "redirect_uri": self.callback_url,
-            "scope": params.scope or "read write",
+            "scope": scope_str,
             "state": our_state,
         }
         
