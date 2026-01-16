@@ -187,10 +187,6 @@ async def oauth_token(request):
     })
 
 
-# ============================================================================
-# MIDDLEWARE TO REQUIRE AUTH
-# ============================================================================
-
 @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
 async def protected_resource_config(request):
     """Indicate that this resource requires OAuth"""
@@ -201,14 +197,21 @@ async def protected_resource_config(request):
 
 
 # ============================================================================
-# MCP TOOLS
+# AUTH HELPERS
 # ============================================================================
 
-# ============================================================================
-# MCP TOOLS
-# ============================================================================
+def raise_auth_required():
+    """Raise a 401 with proper WWW-Authenticate header to trigger OAuth flow"""
+    raise HTTPException(
+        status_code=401,
+        detail="Authentication required",
+        headers={
+            "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource", scope="read write offline"'
+        }
+    )
 
-def check_authentication():
+
+def check_authentication() -> str:
     """Check if we have a valid token, raise 401 with proper headers if not"""
     # Try to get token from request context first
     try:
@@ -232,52 +235,60 @@ def check_authentication():
             if "access_token" in value and len(value["access_token"]) > 20:
                 return value["access_token"]
     
-    # THIS IS THE KEY: Include WWW-Authenticate header with resource_metadata
-    raise HTTPException(
-        status_code=401,
-        detail="Authentication required",
-        headers={
-            "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource", scope="read write offline"'
-        }
-    )
+    raise_auth_required()
+
+
+async def blackboard_request(method: str, endpoint: str, token: str, **kwargs) -> httpx.Response:
+    """
+    Make a request to Blackboard API.
+    Raises proper 401 if token is invalid/expired to trigger re-auth.
+    """
+    async with httpx.AsyncClient() as client:
+        response = await client.request(
+            method,
+            f"{BLACKBOARD_URL}{endpoint}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30.0,
+            **kwargs
+        )
+        
+        print(f"[Blackboard API] {method} {endpoint} -> {response.status_code}")
+        
+        # If Blackboard says unauthorized, trigger re-auth flow
+        if response.status_code == 401:
+            raise_auth_required()
+        
+        return response
+
+
+# ============================================================================
+# MCP TOOLS
+# ============================================================================
+
 @mcp.tool()
 async def get_my_courses() -> str:
     """
     Get all courses you have access to in Blackboard.
     Requires authentication.
     """
-    token = check_authentication()  # Let HTTPException propagate (don't catch it)
+    token = check_authentication()
     
-    print(f"[Tool] get_my_courses - using token: {token[:10]}...")
+    response = await blackboard_request("GET", "/learn/api/public/v1/courses?limit=100", token)
     
+    if response.status_code != 200:
+        return f"Error: {response.status_code} - {response.text}"
     
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{BLACKBOARD_URL}/learn/api/public/v1/courses?limit=100",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=30.0
-            )
-            
-            print(f"[Tool] Blackboard API response: {response.status_code}")
-            
-            if response.status_code != 200:
-                return f"Error: {response.status_code} - {response.text}"
-            
-            data = response.json()
-            courses = data.get("results", [])
-            
-            if not courses:
-                return "No courses found"
-            
-            result = f"Found {len(courses)} courses:\n\n"
-            for course in courses:
-                result += f"- {course.get('name', 'Unnamed')} (ID: {course.get('id')})\n"
-            
-            return result
-    except Exception as e:
-        print(f"[Tool ERROR] {str(e)}")
-        return f"Error calling Blackboard API: {str(e)}"
+    data = response.json()
+    courses = data.get("results", [])
+    
+    if not courses:
+        return "No courses found"
+    
+    result = f"Found {len(courses)} courses:\n\n"
+    for course in courses:
+        result += f"- {course.get('name', 'Unnamed')} (ID: {course.get('id')})\n"
+    
+    return result
 
 
 @mcp.tool()
@@ -288,43 +299,34 @@ async def get_course_assignments(course_id: str) -> str:
     Args:
         course_id: The course ID from get_my_courses (e.g., "_123_1")
     """
-    if not _tokens:
-        return "Error: Not authenticated."
+    token = check_authentication()
     
-    latest_token = list(_tokens.values())[-1]
-    token = latest_token["access_token"]
+    response = await blackboard_request(
+        "GET",
+        f"/learn/api/public/v1/courses/{course_id}/gradebook/columns",
+        token
+    )
     
-    print(f"[Tool] get_course_assignments for course: {course_id}")
+    if response.status_code != 200:
+        return f"Error: {response.status_code} - {response.text}"
     
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{BLACKBOARD_URL}/learn/api/public/v1/courses/{course_id}/gradebook/columns",
-                headers={"Authorization": f"Bearer {token}"}
-            )
-            
-            if response.status_code != 200:
-                return f"Error: {response.status_code} - {response.text}"
-            
-            data = response.json()
-            columns = data.get("results", [])
-            
-            # Filter to assignments with due dates  
-            assignments = [c for c in columns if c.get("grading", {}).get("due")]
-            
-            if not assignments:
-                return f"No assignments with due dates found in course {course_id}"
-            
-            result = f"Found {len(assignments)} assignments:\n\n"
-            for assignment in assignments:
-                name = assignment.get("name", "Unnamed")
-                points = assignment.get("score", {}).get("possible", "?")
-                due = assignment.get("grading", {}).get("due", "No due date")
-                result += f"- {name} ({points} points) - Due: {due}\n"
-            
-            return result
-    except Exception as e:
-        return f"Error: {str(e)}"
+    data = response.json()
+    columns = data.get("results", [])
+    
+    # Filter to assignments with due dates
+    assignments = [c for c in columns if c.get("grading", {}).get("due")]
+    
+    if not assignments:
+        return f"No assignments with due dates found in course {course_id}"
+    
+    result = f"Found {len(assignments)} assignments:\n\n"
+    for assignment in assignments:
+        name = assignment.get("name", "Unnamed")
+        points = assignment.get("score", {}).get("possible", "?")
+        due = assignment.get("grading", {}).get("due", "No due date")
+        result += f"- {name} ({points} points) - Due: {due}\n"
+    
+    return result
 
 
 @mcp.tool()
@@ -348,4 +350,5 @@ async def check_config() -> str:
         f"- Authorize: {SERVER_URL}/oauth/authorize\n"
         f"- Token: {SERVER_URL}/oauth/token\n"
         f"- Callback: {SERVER_URL}/oauth/callback\n"
+        f"- Protected Resource: {SERVER_URL}/.well-known/oauth-protected-resource\n"
     )
