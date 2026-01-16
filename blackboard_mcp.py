@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 from fastmcp import FastMCP
 from starlette.responses import RedirectResponse, JSONResponse
 from starlette.requests import Request
+from starlette.exceptions import HTTPException
 
 # ============================================================================
 # CONFIGURATION
@@ -208,21 +209,32 @@ async def protected_resource_config(request):
 # ============================================================================
 
 def check_authentication():
-    """Check if we have a valid token, raise error if not"""
-    if not _tokens:
-        raise Exception("Authentication required. Please log in to Blackboard.")
+    """Check if we have a valid token, raise 401 if not"""
+    # Try to get token from request context first (how Claude sends it)
+    try:
+        from fastmcp.server.context import request_ctx
+        ctx = request_ctx.get()
+        auth_header = ctx.request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            # Store it for use
+            if token not in _tokens:
+                _tokens[token] = {"access_token": token, "exchanged": True}
+            return token
+    except Exception:
+        pass
     
-    # Find a valid token
-    for value in _tokens.values():
-        if value.get("exchanged") and "access_token" in value:
-            return value["access_token"]
+    # Fall back to stored tokens
+    if _tokens:
+        for value in _tokens.values():
+            if value.get("exchanged") and "access_token" in value:
+                return value["access_token"]
+        for value in _tokens.values():
+            if "access_token" in value and len(value["access_token"]) > 20:
+                return value["access_token"]
     
-    # Fallback
-    for value in _tokens.values():
-        if "access_token" in value and len(value["access_token"]) > 20:
-            return value["access_token"]
-    
-    raise Exception("No valid authentication token found. Please reconnect.")
+    # THIS IS THE KEY CHANGE: Raise 401 instead of returning an error string
+    raise HTTPException(status_code=401, detail="Authentication required")
 
 
 @mcp.tool()
@@ -231,12 +243,10 @@ async def get_my_courses() -> str:
     Get all courses you have access to in Blackboard.
     Requires authentication.
     """
-    try:
-        token = check_authentication()
-    except Exception as e:
-        return f"Error: {str(e)}\n\nPlease authenticate by visiting:\n{SERVER_URL}/oauth/authorize?client_id=claude&redirect_uri=http://localhost:49088/oauth/callback&response_type=code&state=auth&scope=read%20write%20offline"
+    token = check_authentication()  # Let HTTPException propagate (don't catch it)
     
     print(f"[Tool] get_my_courses - using token: {token[:10]}...")
+    
     
     try:
         async with httpx.AsyncClient() as client:
