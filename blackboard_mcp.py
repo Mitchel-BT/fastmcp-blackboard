@@ -9,7 +9,7 @@ import time
 import httpx
 from urllib.parse import urlencode
 from fastmcp import FastMCP
-from starlette.responses import RedirectResponse, JSONResponse
+from starlette.responses import RedirectResponse, JSONResponse, Response
 from starlette.requests import Request
 from starlette.exceptions import HTTPException
 
@@ -209,15 +209,14 @@ async def protected_resource_config(request):
 # ============================================================================
 
 def check_authentication():
-    """Check if we have a valid token, raise 401 if not"""
-    # Try to get token from request context first (how Claude sends it)
+    """Check if we have a valid token, raise 401 with proper headers if not"""
+    # Try to get token from request context first
     try:
         from fastmcp.server.context import request_ctx
         ctx = request_ctx.get()
         auth_header = ctx.request.headers.get("authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:]
-            # Store it for use
             if token not in _tokens:
                 _tokens[token] = {"access_token": token, "exchanged": True}
             return token
@@ -233,10 +232,14 @@ def check_authentication():
             if "access_token" in value and len(value["access_token"]) > 20:
                 return value["access_token"]
     
-    # THIS IS THE KEY CHANGE: Raise 401 instead of returning an error string
-    raise HTTPException(status_code=401, detail="Authentication required")
-
-
+    # THIS IS THE KEY: Include WWW-Authenticate header with resource_metadata
+    raise HTTPException(
+        status_code=401,
+        detail="Authentication required",
+        headers={
+            "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource", scope="read write offline"'
+        }
+    )
 @mcp.tool()
 async def get_my_courses() -> str:
     """
