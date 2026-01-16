@@ -12,6 +12,7 @@ from fastmcp import FastMCP
 from starlette.responses import RedirectResponse, JSONResponse, Response
 from starlette.requests import Request
 from starlette.exceptions import HTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # ============================================================================
 # CONFIGURATION
@@ -32,6 +33,74 @@ _tokens = {}
 
 
 # ============================================================================
+# AUTHENTICATION MIDDLEWARE (ASGI-level)
+# ============================================================================
+
+class BlackboardAuthMiddleware(BaseHTTPMiddleware):
+    """
+    ASGI middleware that validates tokens at the HTTP level.
+    Returns proper 401 with WWW-Authenticate header to trigger OAuth flow.
+    """
+    
+    # Paths that don't require authentication
+    PUBLIC_PATHS = [
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/oauth-protected-resource", 
+        "/oauth/authorize",
+        "/oauth/callback",
+        "/oauth/token",
+        "/oauth/register",
+    ]
+    
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        
+        # Allow public OAuth endpoints without auth
+        if any(path.startswith(p) for p in self.PUBLIC_PATHS):
+            return await call_next(request)
+        
+        # Check for Bearer token
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return self._unauthorized_response()
+        
+        token = auth_header[7:]
+        
+        # Validate token against Blackboard
+        is_valid = await self._validate_token_with_blackboard(token)
+        if not is_valid:
+            return self._unauthorized_response()
+        
+        # Token is valid, continue
+        return await call_next(request)
+    
+    async def _validate_token_with_blackboard(self, token: str) -> bool:
+        """Check if token is valid by making a test call to Blackboard API"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{BLACKBOARD_URL}/learn/api/public/v1/users/me",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10.0
+                )
+                return response.status_code == 200
+        except Exception as e:
+            print(f"[Auth] Token validation error: {e}")
+            return False
+    
+    def _unauthorized_response(self) -> Response:
+        """Return 401 with WWW-Authenticate header to trigger OAuth flow"""
+        return Response(
+            content='{"error": "unauthorized", "message": "Authentication required"}',
+            status_code=401,
+            media_type="application/json",
+            headers={
+                "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource", scope="read write offline"'
+            }
+        )
+
+
+# ============================================================================
 # OAUTH ROUTES
 # ============================================================================
 
@@ -42,9 +111,35 @@ async def oauth_config(request):
         "issuer": SERVER_URL,
         "authorization_endpoint": f"{SERVER_URL}/oauth/authorize",
         "token_endpoint": f"{SERVER_URL}/oauth/token",
+        "registration_endpoint": f"{SERVER_URL}/oauth/register",
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+        "scopes_supported": ["read", "write", "offline"]
+    })
+
+
+@mcp.custom_route("/oauth/register", methods=["POST"])
+async def oauth_register(request):
+    """Dynamic Client Registration - accepts any client (proxy pattern)"""
+    try:
+        body = await request.json()
+    except:
+        body = {}
+    
+    client_id = secrets.token_urlsafe(16)
+    redirect_uris = body.get("redirect_uris", [])
+    
+    print(f"[OAuth] Client registration: {client_id}")
+    
+    return JSONResponse({
+        "client_id": client_id,
+        "client_secret": "",
+        "redirect_uris": redirect_uris,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none"
     })
 
 
@@ -170,11 +265,8 @@ async def oauth_token(request):
     if not token_data:
         return JSONResponse({"error": "invalid_code"}, status_code=400)
     
-    # Don't delete the token - keep it for tool calls
-    # Just mark it as used
+    # Mark as exchanged and store by access token
     token_data["exchanged"] = True
-    
-    # Also store by access token for easy lookup
     _tokens[token_data["access_token"]] = token_data
     
     print(f"[Token] Returning token to Claude: {token_data['access_token'][:10]}...")
@@ -192,57 +284,18 @@ async def protected_resource_config(request):
     """Indicate that this resource requires OAuth"""
     return JSONResponse({
         "resource": SERVER_URL,
-        "authorization_servers": [SERVER_URL]
+        "authorization_servers": [SERVER_URL],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": ["read", "write", "offline"]
     })
 
 
 # ============================================================================
-# AUTH HELPERS
+# HELPER: Make Blackboard API calls
 # ============================================================================
 
-def raise_auth_required():
-    """Raise a 401 with proper WWW-Authenticate header to trigger OAuth flow"""
-    raise HTTPException(
-        status_code=401,
-        detail="Authentication required",
-        headers={
-            "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource", scope="read write offline"'
-        }
-    )
-
-
-def check_authentication() -> str:
-    """Check if we have a valid token, raise 401 with proper headers if not"""
-    # Try to get token from request context first
-    try:
-        from fastmcp.server.context import request_ctx
-        ctx = request_ctx.get()
-        auth_header = ctx.request.headers.get("authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-            if token not in _tokens:
-                _tokens[token] = {"access_token": token, "exchanged": True}
-            return token
-    except Exception:
-        pass
-    
-    # Fall back to stored tokens
-    if _tokens:
-        for value in _tokens.values():
-            if value.get("exchanged") and "access_token" in value:
-                return value["access_token"]
-        for value in _tokens.values():
-            if "access_token" in value and len(value["access_token"]) > 20:
-                return value["access_token"]
-    
-    raise_auth_required()
-
-
 async def blackboard_request(method: str, endpoint: str, token: str, **kwargs) -> httpx.Response:
-    """
-    Make a request to Blackboard API.
-    Raises proper 401 if token is invalid/expired to trigger re-auth.
-    """
+    """Make a request to Blackboard API."""
     async with httpx.AsyncClient() as client:
         response = await client.request(
             method,
@@ -251,14 +304,16 @@ async def blackboard_request(method: str, endpoint: str, token: str, **kwargs) -
             timeout=30.0,
             **kwargs
         )
-        
         print(f"[Blackboard API] {method} {endpoint} -> {response.status_code}")
-        
-        # If Blackboard says unauthorized, trigger re-auth flow
-        if response.status_code == 401:
-            raise_auth_required()
-        
         return response
+
+
+def get_token_from_header(request_headers: dict) -> str:
+    """Extract Bearer token from Authorization header"""
+    auth_header = request_headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header[7:]
+    return ""
 
 
 # ============================================================================
@@ -271,7 +326,13 @@ async def get_my_courses() -> str:
     Get all courses you have access to in Blackboard.
     Requires authentication.
     """
-    token = check_authentication()
+    # Get token from request context
+    from fastmcp.server.dependencies import get_http_headers
+    headers = get_http_headers()
+    token = get_token_from_header(headers)
+    
+    if not token:
+        return "Error: No authentication token found"
     
     response = await blackboard_request("GET", "/learn/api/public/v1/courses?limit=100", token)
     
@@ -299,7 +360,12 @@ async def get_course_assignments(course_id: str) -> str:
     Args:
         course_id: The course ID from get_my_courses (e.g., "_123_1")
     """
-    token = check_authentication()
+    from fastmcp.server.dependencies import get_http_headers
+    headers = get_http_headers()
+    token = get_token_from_header(headers)
+    
+    if not token:
+        return "Error: No authentication token found"
     
     response = await blackboard_request(
         "GET",
@@ -347,8 +413,30 @@ async def check_config() -> str:
         f"Server URL: {SERVER_URL}\n"
         f"\nOAuth Endpoints:\n"
         f"- Discovery: {SERVER_URL}/.well-known/oauth-authorization-server\n"
+        f"- Protected Resource: {SERVER_URL}/.well-known/oauth-protected-resource\n"
+        f"- Register: {SERVER_URL}/oauth/register\n"
         f"- Authorize: {SERVER_URL}/oauth/authorize\n"
         f"- Token: {SERVER_URL}/oauth/token\n"
         f"- Callback: {SERVER_URL}/oauth/callback\n"
-        f"- Protected Resource: {SERVER_URL}/.well-known/oauth-protected-resource\n"
     )
+
+
+# ============================================================================
+# APP SETUP - Add middleware to the ASGI app
+# ============================================================================
+
+def create_app():
+    """Create the ASGI app with authentication middleware"""
+    from starlette.applications import Starlette
+    
+    # Get the base app from FastMCP
+    app = mcp.http_app()
+    
+    # Add our auth middleware
+    app.add_middleware(BlackboardAuthMiddleware)
+    
+    return app
+
+
+# For FastMCP Cloud deployment
+app = create_app()
