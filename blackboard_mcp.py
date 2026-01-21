@@ -1,17 +1,11 @@
 """
 Blackboard MCP Server - Using FastMCP's OAuth Proxy for proper multi-user support
-This allows Claude to properly authenticate users via Blackboard OAuth
 """
 import os
 import logging
 import httpx
 from fastmcp import FastMCP
-from fastmcp.server.auth import OAuthProxy
-from fastmcp.server.auth.token_verification import TokenVerifier, TokenVerificationResult
-from fastmcp.server.dependencies import get_access_token
-
-# For Redis storage
-from key_value.aio.stores.redis import RedisStore
+from fastmcp.server.auth import OAuthProxy, AccessToken
 
 # ============================================================================
 # LOGGING SETUP
@@ -30,11 +24,7 @@ BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY")
 BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET")
 SERVER_URL = os.environ.get("SERVER_URL")
 
-# Upstash Redis for token storage
-UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
-UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
-
-# JWT signing key for production (generate a random string)
+# JWT signing key for production
 JWT_SIGNING_KEY = os.environ.get("JWT_SIGNING_KEY", BLACKBOARD_APP_SECRET)
 
 
@@ -42,7 +32,7 @@ JWT_SIGNING_KEY = os.environ.get("JWT_SIGNING_KEY", BLACKBOARD_APP_SECRET)
 # CUSTOM TOKEN VERIFIER FOR BLACKBOARD
 # ============================================================================
 
-class BlackboardTokenVerifier(TokenVerifier):
+class BlackboardTokenVerifier:
     """
     Custom token verifier for Blackboard OAuth tokens.
     Blackboard returns opaque tokens, so we verify by calling Blackboard's API.
@@ -56,7 +46,7 @@ class BlackboardTokenVerifier(TokenVerifier):
     def required_scopes(self) -> list[str]:
         return self._required_scopes
     
-    async def verify_token(self, token: str) -> TokenVerificationResult:
+    async def verify_token(self, token: str) -> AccessToken | None:
         """Verify Blackboard token by calling the users/me endpoint"""
         try:
             async with httpx.AsyncClient() as client:
@@ -73,23 +63,18 @@ class BlackboardTokenVerifier(TokenVerifier):
                     
                     logger.info(f"Token verified for user: {username} ({user_id})")
                     
-                    return TokenVerificationResult(
-                        valid=True,
+                    return AccessToken(
+                        token=token,
                         client_id=user_id,
                         scopes=self._required_scopes,
-                        claims={
-                            "sub": user_id,
-                            "username": username,
-                            "user_data": user_data
-                        }
                     )
                 else:
                     logger.warning(f"Token verification failed: {response.status_code}")
-                    return TokenVerificationResult(valid=False)
+                    return None
                     
         except Exception as e:
             logger.error(f"Token verification error: {e}")
-            return TokenVerificationResult(valid=False)
+            return None
 
 
 # ============================================================================
@@ -101,20 +86,6 @@ token_verifier = BlackboardTokenVerifier(
     blackboard_url=BLACKBOARD_URL,
     required_scopes=["read", "write"]
 )
-
-# Create Redis storage for OAuth client data
-# Note: Using standard redis URL format for key_value store
-redis_store = None
-if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
-    # Parse Upstash REST URL to get host
-    # Upstash REST URL is like https://xxx.upstash.io
-    # We need to construct a redis:// URL for the key_value store
-    import re
-    match = re.search(r'https://([^/]+)', UPSTASH_REDIS_REST_URL)
-    if match:
-        redis_host = match.group(1)
-        # For Upstash, use their Redis URL format
-        logger.info(f"Using Redis storage at {redis_host}")
 
 # Create the OAuth proxy for Blackboard
 auth = OAuthProxy(
@@ -147,12 +118,13 @@ mcp = FastMCP(name="Blackboard", auth=auth)
 
 
 # ============================================================================
-# HELPER TO GET CURRENT USER
+# HELPER TO GET CURRENT USER TOKEN
 # ============================================================================
 
 async def get_current_user_token() -> str | None:
     """Get the access token for the current authenticated user"""
     try:
+        from fastmcp.server.dependencies import get_access_token
         token = get_access_token()
         if token:
             logger.debug(f"Got access token: {token[:20]}...")
@@ -282,23 +254,20 @@ async def check_auth_status() -> str:
     if not token:
         return (
             "🔒 **Not Authenticated**\n\n"
-            "To use Blackboard tools, you need to connect this server through Claude's OAuth flow.\n\n"
-            "Go to **Settings > Integrations** and reconnect the Blackboard connector."
+            "To use Blackboard tools, connect this server through Claude's integrations.\n\n"
+            "Go to **Settings > Integrations** and add or reconnect the Blackboard connector."
         )
     
     # Verify the token is still valid
     result = await token_verifier.verify_token(token)
     
-    if result.valid:
-        username = result.claims.get("username", "unknown")
-        user_id = result.claims.get("sub", "unknown")
+    if result:
         return (
             f"✅ **Authenticated**\n\n"
-            f"• **Username:** `{username}`\n"
-            f"• **User ID:** `{user_id}`"
+            f"• **User ID:** `{result.client_id}`"
         )
     else:
-        return "⚠️ **Token Invalid**\n\nPlease reconnect through Claude's OAuth flow."
+        return "⚠️ **Token Invalid**\n\nPlease reconnect through Claude's integrations."
 
 
 @mcp.tool()
