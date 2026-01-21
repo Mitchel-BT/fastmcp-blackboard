@@ -7,7 +7,7 @@ import base64
 import secrets
 import time
 import httpx
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 from fastmcp import FastMCP
 from starlette.responses import RedirectResponse, JSONResponse, HTMLResponse
 from starlette.requests import Request
@@ -47,9 +47,40 @@ async def oauth_config(request):
     })
 
 
+@mcp.custom_route("/oauth/start", methods=["GET"])
+async def oauth_start(request):
+    """Generate and return an authorization URL for the user to click"""
+    # Generate state to track this flow
+    our_state = secrets.token_urlsafe(32)
+    
+    # Store minimal info - we'll get the rest when callback happens
+    _pending_auths[our_state] = {
+        "timestamp": time.time()
+    }
+    
+    # Build the Blackboard auth URL
+    callback_uri = f"{SERVER_URL}/oauth/callback"
+    
+    blackboard_auth_url = (
+        f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode"
+        f"?response_type=code"
+        f"&client_id={BLACKBOARD_APP_KEY}"
+        f"&redirect_uri={quote(callback_uri, safe='')}"
+        f"&scope=read+write+offline"
+        f"&state={our_state}"
+    )
+    
+    print(f"[OAuth Start] Generated auth URL")
+    
+    return JSONResponse({
+        "auth_url": blackboard_auth_url,
+        "message": "Please click this link to authenticate with Blackboard"
+    })
+
+
 @mcp.custom_route("/oauth/authorize", methods=["GET"])
 async def oauth_authorize(request):
-    """OAuth authorization endpoint - shows link instead of auto-redirecting"""
+    """OAuth authorization endpoint - redirects immediately to Blackboard"""
     client_id = request.query_params.get("client_id")
     redirect_uri = request.query_params.get("redirect_uri")
     state = request.query_params.get("state")
@@ -69,76 +100,22 @@ async def oauth_authorize(request):
         "timestamp": time.time()
     }
     
-    # Build the Blackboard auth URL
+    # Build the Blackboard auth URL with proper encoding
+    callback_uri = f"{SERVER_URL}/oauth/callback"
+    
     blackboard_auth_url = (
         f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode"
-        f"?redirect_uri={SERVER_URL}/oauth/callback"
-        f"&response_type=code"
+        f"?response_type=code"
         f"&client_id={BLACKBOARD_APP_KEY}"
-        f"&scope=read%20write%20offline"
+        f"&redirect_uri={quote(callback_uri, safe='')}"
+        f"&scope=read+write+offline"
         f"&state={our_state}"
     )
     
-    print(f"[OAuth] Generated auth URL: {blackboard_auth_url[:80]}...")
+    print(f"[OAuth] Redirecting to: {blackboard_auth_url[:100]}...")
     
-    # Return an HTML page with the link that the user can click
-    html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Blackboard Authentication</title>
-        <style>
-            body {{
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                min-height: 100vh;
-                margin: 0;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            }}
-            .container {{
-                background: white;
-                padding: 2rem;
-                border-radius: 8px;
-                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                text-align: center;
-                max-width: 400px;
-            }}
-            h1 {{
-                color: #333;
-                margin-bottom: 1rem;
-            }}
-            p {{
-                color: #666;
-                margin-bottom: 1.5rem;
-            }}
-            .btn {{
-                display: inline-block;
-                background: #667eea;
-                color: white;
-                padding: 12px 24px;
-                text-decoration: none;
-                border-radius: 4px;
-                font-weight: 500;
-                transition: background 0.2s;
-            }}
-            .btn:hover {{
-                background: #5568d3;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🎓 Blackboard Authentication</h1>
-            <p>Click the button below to authenticate with Blackboard and grant access to your courses.</p>
-            <a href="{blackboard_auth_url}" class="btn">Connect to Blackboard</a>
-        </div>
-    </body>
-    </html>
-    """
-    
-    return HTMLResponse(content=html_content)
+    # Redirect directly to Blackboard
+    return RedirectResponse(blackboard_auth_url)
 
 
 @mcp.custom_route("/oauth/callback", methods=["GET"])
@@ -151,14 +128,47 @@ async def oauth_callback(request):
     print(f"[Callback] Received from Blackboard")
     
     if error:
-        return HTMLResponse(f"<h1>Authentication Error</h1><p>{error}</p>", status_code=400)
+        return HTMLResponse(
+            f"""
+            <html>
+            <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
+                <h1>❌ Authentication Error</h1>
+                <p>{error}</p>
+                <p>You can close this window and try again.</p>
+            </body>
+            </html>
+            """, 
+            status_code=400
+        )
     
     if not code or not state:
-        return HTMLResponse("<h1>Error</h1><p>Missing parameters</p>", status_code=400)
+        return HTMLResponse(
+            """
+            <html>
+            <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
+                <h1>❌ Error</h1>
+                <p>Missing required parameters</p>
+                <p>You can close this window and try again.</p>
+            </body>
+            </html>
+            """, 
+            status_code=400
+        )
     
     original = _pending_auths.get(state)
     if not original:
-        return HTMLResponse("<h1>Error</h1><p>Invalid or expired state</p>", status_code=400)
+        return HTMLResponse(
+            """
+            <html>
+            <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
+                <h1>❌ Error</h1>
+                <p>Invalid or expired authentication session</p>
+                <p>You can close this window and try again.</p>
+            </body>
+            </html>
+            """, 
+            status_code=400
+        )
     
     del _pending_auths[state]
     
@@ -185,7 +195,18 @@ async def oauth_callback(request):
             
             if response.status_code != 200:
                 print(f"[Callback ERROR] {response.text}")
-                return HTMLResponse(f"<h1>Error</h1><p>Token exchange failed: {response.text}</p>", status_code=500)
+                return HTMLResponse(
+                    f"""
+                    <html>
+                    <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
+                        <h1>❌ Token Exchange Failed</h1>
+                        <p>{response.text}</p>
+                        <p>You can close this window and try again.</p>
+                    </body>
+                    </html>
+                    """, 
+                    status_code=500
+                )
             
             token_data = response.json()
             print(f"[Callback] Got token from Blackboard")
@@ -202,14 +223,39 @@ async def oauth_callback(request):
             "timestamp": time.time()
         }
         
-        # Redirect back to Claude
-        redirect_url = f"{original['redirect_uri']}?code={claude_code}&state={original['state']}"
-        print(f"[Callback] Redirecting to Claude")
-        return RedirectResponse(redirect_url)
+        # If we have the original redirect_uri (from Claude), redirect back
+        if original.get("redirect_uri"):
+            redirect_url = f"{original['redirect_uri']}?code={claude_code}&state={original['state']}"
+            print(f"[Callback] Redirecting to Claude")
+            return RedirectResponse(redirect_url)
+        else:
+            # Otherwise, show success page
+            return HTMLResponse(
+                """
+                <html>
+                <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
+                    <h1>✅ Authentication Successful!</h1>
+                    <p>You can now close this window and return to Claude.</p>
+                    <p>Your Blackboard account is connected.</p>
+                </body>
+                </html>
+                """
+            )
         
     except Exception as e:
         print(f"[Callback ERROR] {str(e)}")
-        return HTMLResponse(f"<h1>Error</h1><p>{str(e)}</p>", status_code=500)
+        return HTMLResponse(
+            f"""
+            <html>
+            <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
+                <h1>❌ Error</h1>
+                <p>{str(e)}</p>
+                <p>You can close this window and try again.</p>
+            </body>
+            </html>
+            """, 
+            status_code=500
+        )
 
 
 @mcp.custom_route("/oauth/token", methods=["POST"])
@@ -291,6 +337,7 @@ async def check_config() -> str:
         f"- Authorize: {SERVER_URL}/oauth/authorize\n"
         f"- Token: {SERVER_URL}/oauth/token\n"
         f"- Callback: {SERVER_URL}/oauth/callback\n"
+        f"- Start: {SERVER_URL}/oauth/start\n"
     )
 
 
