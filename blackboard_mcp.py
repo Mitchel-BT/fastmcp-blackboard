@@ -464,6 +464,21 @@ async def get_course_assignments(course_id: str, ctx: Context = CurrentContext()
 async def logout(ctx: Context = CurrentContext()) -> str:
     delete_session_token(ctx.session_id)
     return "✅ Logged out for this Claude session."
+  
+@mcp.custom_route("/debug/session", methods=["GET"])
+async def debug_session_http(request):
+    sid = request.query_params.get("sid")
+    if not sid:
+        return JSONResponse({"error": "missing_sid"}, status_code=400)
+
+    token_data = get_session_token(sid)
+
+    return JSONResponse({
+        "sid": sid,
+        "has_token": bool(token_data),
+        "user_id": token_data.get("user_id") if token_data else None,
+        "redirect_uri": REDIRECT_URI,
+    })
 
 
 @mcp.tool()
