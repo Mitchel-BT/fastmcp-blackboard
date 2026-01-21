@@ -221,6 +221,7 @@ async def auth_callback(request):
 
 def success_page(token: str, user_id: str) -> str:
     masked_token = "•" * 28 + token[-4:]
+    copy_message = f"Here's my Blackboard access token: {token}"
     return f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -244,7 +245,7 @@ def success_page(token: str, user_id: str) -> str:
                 border-radius: 16px;
                 box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
                 padding: 40px;
-                max-width: 520px;
+                max-width: 560px;
                 width: 100%;
                 text-align: center;
             }}
@@ -274,12 +275,82 @@ def success_page(token: str, user_id: str) -> str:
                 font-size: 14px;
                 margin-bottom: 24px;
             }}
+            .step-section {{
+                background: #f0fdf4;
+                border: 2px solid #86efac;
+                border-radius: 12px;
+                padding: 20px;
+                margin-bottom: 20px;
+                text-align: left;
+            }}
+            .step-header {{
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                margin-bottom: 12px;
+            }}
+            .step-number {{
+                background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+                color: white;
+                width: 28px;
+                height: 28px;
+                border-radius: 50%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 14px;
+                font-weight: 700;
+            }}
+            .step-title {{
+                color: #166534;
+                font-size: 14px;
+                font-weight: 600;
+            }}
+            .copy-message-box {{
+                background: white;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 12px 16px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                font-size: 14px;
+                color: #374151;
+                position: relative;
+            }}
+            .copy-message-box code {{
+                color: #7c3aed;
+                font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+                background: #f3f4f6;
+                padding: 2px 6px;
+                border-radius: 4px;
+                font-size: 13px;
+            }}
+            .btn {{
+                width: 100%;
+                padding: 14px 20px;
+                border-radius: 8px;
+                font-size: 15px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: transform 0.2s, box-shadow 0.2s;
+                border: none;
+                margin-top: 12px;
+            }}
+            .btn:hover {{
+                transform: translateY(-2px);
+            }}
+            .btn-copy {{
+                background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+                color: white;
+            }}
+            .btn-copy:hover {{
+                box-shadow: 0 10px 20px -10px rgba(16, 185, 129, 0.5);
+            }}
             .warning-box {{
                 background: #fef3c7;
                 border: 1px solid #f59e0b;
                 border-radius: 8px;
                 padding: 12px 16px;
-                margin-bottom: 20px;
+                margin-top: 20px;
                 display: flex;
                 align-items: flex-start;
                 gap: 10px;
@@ -297,107 +368,77 @@ def success_page(token: str, user_id: str) -> str:
                 font-size: 13px;
                 line-height: 1.4;
             }}
-            .token-section {{
+            .divider {{
+                display: flex;
+                align-items: center;
+                gap: 16px;
+                margin: 24px 0;
+                color: #9ca3af;
+                font-size: 12px;
+            }}
+            .divider::before, .divider::after {{
+                content: '';
+                flex: 1;
+                height: 1px;
+                background: #e5e7eb;
+            }}
+            .details-section {{
+                text-align: left;
+            }}
+            .details-toggle {{
+                color: #6b7280;
+                font-size: 13px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }}
+            .details-toggle:hover {{
+                color: #374151;
+            }}
+            .details-content {{
+                display: none;
+                margin-top: 12px;
+                padding: 16px;
                 background: #f9fafb;
-                border: 2px solid #e5e7eb;
-                border-radius: 12px;
-                padding: 20px;
-                margin-bottom: 20px;
+                border-radius: 8px;
+            }}
+            .details-content.show {{
+                display: block;
+            }}
+            .token-row {{
+                display: flex;
+                align-items: center;
+                gap: 8px;
             }}
             .token-label {{
-                color: #374151;
+                color: #6b7280;
                 font-size: 12px;
-                font-weight: 600;
-                text-transform: uppercase;
-                letter-spacing: 0.05em;
-                margin-bottom: 12px;
-            }}
-            .token-container {{
-                position: relative;
+                font-weight: 500;
             }}
             .token-value {{
                 font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-                font-size: 16px;
+                font-size: 13px;
                 color: #374151;
-                background: white;
-                padding: 12px 16px;
-                border-radius: 8px;
-                border: 1px solid #e5e7eb;
-                word-break: break-all;
-                min-height: 44px;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-            }}
-            .token-hidden {{
-                color: #9ca3af;
-                letter-spacing: 2px;
             }}
             .token-revealed {{
                 color: #7c3aed;
             }}
-            .btn-row {{
-                display: flex;
-                gap: 10px;
-                margin-top: 16px;
-            }}
-            .btn {{
-                flex: 1;
-                padding: 12px 20px;
-                border-radius: 8px;
-                font-size: 14px;
-                font-weight: 600;
-                cursor: pointer;
-                transition: transform 0.2s, box-shadow 0.2s;
+            .reveal-btn {{
+                background: none;
                 border: none;
-            }}
-            .btn:hover {{
-                transform: translateY(-2px);
-            }}
-            .btn-reveal {{
-                background: #f3f4f6;
-                color: #374151;
-                border: 1px solid #d1d5db;
-            }}
-            .btn-reveal:hover {{
-                background: #e5e7eb;
-            }}
-            .btn-copy {{
-                background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%);
-                color: white;
-            }}
-            .btn-copy:hover {{
-                box-shadow: 0 10px 20px -10px rgba(124, 58, 237, 0.5);
-            }}
-            .instructions {{
-                background: #eff6ff;
-                border-left: 4px solid #3b82f6;
-                padding: 16px;
-                border-radius: 0 8px 8px 0;
-                text-align: left;
-            }}
-            .instructions h3 {{
-                color: #1e40af;
-                font-size: 14px;
-                font-weight: 600;
-                margin-bottom: 8px;
-            }}
-            .instructions p {{
-                color: #1e3a8a;
-                font-size: 13px;
-                line-height: 1.5;
-            }}
-            .instructions code {{
-                background: #dbeafe;
-                padding: 2px 6px;
-                border-radius: 4px;
-                font-family: monospace;
+                color: #6b7280;
+                cursor: pointer;
                 font-size: 12px;
+                padding: 4px 8px;
+            }}
+            .reveal-btn:hover {{
+                color: #374151;
             }}
             .user-info {{
                 color: #9ca3af;
                 font-size: 12px;
-                margin-top: 20px;
+                margin-top: 16px;
             }}
             .copied-toast {{
                 position: fixed;
@@ -430,86 +471,104 @@ def success_page(token: str, user_id: str) -> str:
             <h1>Authentication Successful!</h1>
             <p class="subtitle">Your Blackboard account is now connected</p>
             
+            <div class="step-section">
+                <div class="step-header">
+                    <div class="step-number">1</div>
+                    <div class="step-title">Copy this message to send to Claude</div>
+                </div>
+                <div class="copy-message-box">
+                    Here's my Blackboard access token: <code id="tokenInMessage">{masked_token}</code>
+                </div>
+                <button class="btn btn-copy" onclick="copyMessage()">
+                    📋 Copy Message to Clipboard
+                </button>
+            </div>
+            
+            <div class="step-section" style="background: #eff6ff; border-color: #93c5fd;">
+                <div class="step-header">
+                    <div class="step-number" style="background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);">2</div>
+                    <div class="step-title" style="color: #1e40af;">Paste it in your Claude conversation</div>
+                </div>
+                <p style="color: #1e3a8a; font-size: 13px; line-height: 1.5;">
+                    Go back to Claude and paste the message. Claude will remember your token and use it for all Blackboard requests in this conversation.
+                </p>
+            </div>
+            
             <div class="warning-box">
                 <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
                 </svg>
                 <p>
-                    <strong>Keep this token secret!</strong> It provides access to your Blackboard account. 
-                    Copy it now and store it securely – you'll need it for this session.
+                    <strong>Keep this token private.</strong> It provides access to your Blackboard data for this session. Don't share it with others.
                 </p>
             </div>
             
-            <div class="token-section">
-                <div class="token-label">Your Personal Access Token</div>
-                <div class="token-container">
-                    <div class="token-value" id="tokenDisplay">
-                        <span id="tokenText" class="token-hidden">{masked_token}</span>
+            <div class="divider">Advanced</div>
+            
+            <div class="details-section">
+                <div class="details-toggle" onclick="toggleDetails()">
+                    <svg id="detailsArrow" width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="transition: transform 0.2s;">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
+                    </svg>
+                    View raw token
+                </div>
+                <div class="details-content" id="detailsContent">
+                    <div class="token-row">
+                        <span class="token-label">Token:</span>
+                        <span class="token-value" id="rawToken">{masked_token}</span>
+                        <button class="reveal-btn" id="revealBtn" onclick="toggleReveal(event)">Show</button>
                     </div>
-                </div>
-                <div class="btn-row">
-                    <button class="btn btn-reveal" id="revealBtn" onclick="toggleReveal()">
-                        👁 Reveal
-                    </button>
-                    <button class="btn btn-copy" onclick="copyToken()">
-                        📋 Copy
-                    </button>
+                    <p class="user-info">Authenticated as: {user_id}</p>
                 </div>
             </div>
-            
-            <div class="instructions">
-                <h3>How to use this token</h3>
-                <p>
-                    When using Blackboard tools in Claude, provide this token as the 
-                    <code>access_token</code> parameter. The token is valid for this session only.
-                </p>
-            </div>
-            
-            <p class="user-info">Authenticated as user: {user_id}</p>
         </div>
         
-        <div class="copied-toast" id="toast">✓ Token copied to clipboard</div>
+        <div class="copied-toast" id="toast">✓ Copied! Now paste it in Claude</div>
         
         <script>
             const actualToken = "{token}";
             const maskedToken = "{masked_token}";
+            const copyMessage = "Here's my Blackboard access token: " + actualToken;
             let isRevealed = false;
-            let hideTimeout = null;
             
-            function toggleReveal() {{
-                const tokenText = document.getElementById('tokenText');
-                const revealBtn = document.getElementById('revealBtn');
-                
-                if (isRevealed) {{
-                    tokenText.textContent = maskedToken;
-                    tokenText.className = 'token-hidden';
-                    revealBtn.textContent = '👁 Reveal';
-                    isRevealed = false;
-                    if (hideTimeout) clearTimeout(hideTimeout);
-                }} else {{
-                    tokenText.textContent = actualToken;
-                    tokenText.className = 'token-revealed';
-                    revealBtn.textContent = '🙈 Hide';
-                    isRevealed = true;
-                    
-                    // Auto-hide after 10 seconds
-                    hideTimeout = setTimeout(() => {{
-                        if (isRevealed) toggleReveal();
-                    }}, 10000);
-                }}
-            }}
-            
-            function copyToken() {{
-                navigator.clipboard.writeText(actualToken).then(() => {{
+            function copyMessage() {{
+                navigator.clipboard.writeText(copyMessage).then(() => {{
                     const toast = document.getElementById('toast');
                     toast.classList.add('show');
-                    setTimeout(() => toast.classList.remove('show'), 2500);
-                    
-                    // Hide token after copying
-                    if (isRevealed) {{
-                        setTimeout(toggleReveal, 500);
-                    }}
+                    setTimeout(() => toast.classList.remove('show'), 3000);
                 }});
+            }}
+            
+            function toggleDetails() {{
+                const content = document.getElementById('detailsContent');
+                const arrow = document.getElementById('detailsArrow');
+                content.classList.toggle('show');
+                arrow.style.transform = content.classList.contains('show') ? 'rotate(90deg)' : 'rotate(0deg)';
+            }}
+            
+            function toggleReveal(e) {{
+                e.stopPropagation();
+                const tokenEl = document.getElementById('rawToken');
+                const btn = document.getElementById('revealBtn');
+                const messageToken = document.getElementById('tokenInMessage');
+                
+                if (isRevealed) {{
+                    tokenEl.textContent = maskedToken;
+                    tokenEl.classList.remove('token-revealed');
+                    messageToken.textContent = maskedToken;
+                    btn.textContent = 'Show';
+                    isRevealed = false;
+                }} else {{
+                    tokenEl.textContent = actualToken;
+                    tokenEl.classList.add('token-revealed');
+                    messageToken.textContent = actualToken;
+                    btn.textContent = 'Hide';
+                    isRevealed = true;
+                    
+                    setTimeout(() => {{
+                        if (isRevealed) toggleReveal(new Event('click'));
+                    }}, 10000);
+                }}
             }}
         </script>
     </body>
@@ -612,7 +671,7 @@ async def get_my_courses(access_token: str) -> dict:
     Get all courses you are enrolled in on Blackboard.
     
     Args:
-        access_token: Your personal access token from authentication
+        access_token: The user's personal access token. Once provided, remember it for all subsequent Blackboard tool calls in this conversation.
     """
     result = await make_blackboard_request(access_token, "users/me/courses")
     
@@ -640,7 +699,7 @@ async def get_course_assignments(access_token: str, course_id: str) -> dict:
     Get assignments/content for a specific course.
     
     Args:
-        access_token: Your personal access token from authentication
+        access_token: The user's personal access token (use the same token from previous calls).
         course_id: The course ID from get_my_courses (e.g., "_123_1")
     """
     return await make_blackboard_request(access_token, f"courses/{course_id}/contents")
@@ -652,7 +711,7 @@ async def get_my_profile(access_token: str) -> dict:
     Get your Blackboard user profile information.
     
     Args:
-        access_token: Your personal access token from authentication
+        access_token: The user's personal access token (use the same token from previous calls).
     """
     return await make_blackboard_request(access_token, "users/me")
 
@@ -661,21 +720,22 @@ async def get_my_profile(access_token: str) -> dict:
 async def get_auth_link() -> dict:
     """
     Get the link to authenticate with Blackboard and receive your personal access token.
+    Call this first if the user hasn't authenticated yet.
     """
     return {
-        "message": "Visit this URL to authenticate with Blackboard and get your access token:",
+        "message": "Visit this URL to authenticate with Blackboard:",
         "auth_url": f"{SERVER_URL}/auth/start",
-        "instructions": "After authenticating, you'll receive a token to use with other Blackboard tools."
+        "next_step": "After authenticating, you'll receive an access token. Paste it here and I'll remember it for all your Blackboard requests in this conversation."
     }
 
 
 @mcp.tool()
 async def check_token_status(access_token: str) -> dict:
     """
-    Check if your access token is valid and see remaining time.
+    Check if an access token is valid and see remaining time.
     
     Args:
-        access_token: Your personal access token from authentication
+        access_token: The user's personal access token to verify.
     """
     user_info = get_user_info(access_token)
     
@@ -691,5 +751,5 @@ async def check_token_status(access_token: str) -> dict:
         "user_id": user_info["user_id"],
         "token_age": f"{user_info['token_age_seconds']} seconds",
         "expires_in": f"{user_info['expires_in_seconds']} seconds",
-        "message": "Token is valid."
+        "message": "Token is valid. Use this token for all Blackboard requests."
     }
