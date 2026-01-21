@@ -13,12 +13,18 @@ from starlette.responses import RedirectResponse, JSONResponse, HTMLResponse
 from starlette.requests import Request
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION - All secrets loaded from environment variables
 # ============================================================================
-BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL", "https://anthropic.bt-retool.shop")
-BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY", "a743ef51-d7bc-4a7e-97e6-bae6f086a0d4")
-BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET", "2DXuZHi9QFZgKfIAkt8JJKhVWDBRdT0q")
-SERVER_URL = os.environ.get("SERVER_URL", "https://blackboard-mcp.fastmcp.app")
+BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL")
+BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY")
+BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET")
+SERVER_URL = os.environ.get("SERVER_URL")
+
+# Validate required environment variables
+_required_vars = ["BLACKBOARD_URL", "BLACKBOARD_APP_KEY", "BLACKBOARD_APP_SECRET", "SERVER_URL"]
+_missing = [var for var in _required_vars if not os.environ.get(var)]
+if _missing:
+    raise EnvironmentError(f"Missing required environment variables: {', '.join(_missing)}")
 
 # ============================================================================
 # MCP SERVER
@@ -58,19 +64,25 @@ def get_auth_link() -> str:
 
 def get_access_token() -> str | None:
     """Get a valid access token if available"""
-    # Check if we have any tokens stored
     if not _tokens:
         return None
     
-    # Get the most recent token
     latest_token = max(_tokens.values(), key=lambda x: x['timestamp'])
     
-    # Check if token is expired (with 5 minute buffer)
     age = time.time() - latest_token['timestamp']
     if age > (latest_token.get('expires_in', 3600) - 300):
         return None
     
     return latest_token['access_token']
+
+
+def get_current_user_id() -> str | None:
+    """Get the user ID from the stored token"""
+    if not _tokens:
+        return None
+    
+    latest_token = max(_tokens.values(), key=lambda x: x['timestamp'])
+    return latest_token.get('user_id')
 
 
 async def make_blackboard_request(endpoint: str, method: str = "GET", **kwargs):
@@ -96,7 +108,6 @@ async def make_blackboard_request(endpoint: str, method: str = "GET", **kwargs):
             response = await client.request(method, url, headers=headers, **kwargs)
             
             if response.status_code == 401:
-                # Token expired or invalid
                 auth_url = get_auth_link()
                 return {
                     "error": "authentication_required",
@@ -347,14 +358,27 @@ async def get_my_courses() -> dict:
     Get all courses you have access to in Blackboard.
     Returns authentication link if not logged in.
     """
-    result = await make_blackboard_request("courses")
+    # Use the user memberships endpoint to get only enrolled courses
+    result = await make_blackboard_request("users/me/courses")
     
     if isinstance(result, dict) and result.get("error") == "authentication_required":
         return result
     
-    # Format courses nicely
     if isinstance(result, dict) and "results" in result:
-        courses = result["results"]
+        memberships = result["results"]
+        
+        # Extract course info from memberships
+        courses = []
+        for membership in memberships:
+            courses.append({
+                "courseId": membership.get("courseId"),
+                "role": membership.get("courseRoleId"),
+                "availability": membership.get("availability", {}).get("available"),
+                "created": membership.get("created"),
+                # Include the full membership data for reference
+                "_membership": membership
+            })
+        
         return {
             "success": True,
             "courses": courses,
@@ -389,9 +413,12 @@ async def check_config() -> str:
         age = int(time.time() - latest['timestamp'])
         token_status = f"Token exists (age: {age}s, user: {latest.get('user_id', 'N/A')})"
     
+    # Mask the app key for security
+    masked_key = f"{BLACKBOARD_APP_KEY[:8]}..." if BLACKBOARD_APP_KEY else "Not set"
+    
     return (
         f"Blackboard URL: {BLACKBOARD_URL}\n"
-        f"App Key: {BLACKBOARD_APP_KEY[:8]}...\n"
+        f"App Key: {masked_key}\n"
         f"Server URL: {SERVER_URL}\n"
         f"\nToken Status: {token_status}\n"
         f"\nOAuth Endpoints:\n"
