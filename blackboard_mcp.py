@@ -1,23 +1,20 @@
 """
-Blackboard MCP Server (FastMCP 3.x) - Session-scoped OAuth with Upstash Redis
+Blackboard MCP Server - Single-user auth (Upstash Redis)
+- OAuth auth code flow
+- Stores one "current" token in Redis (no per-session identity)
+- Works even when MCP session_id changes every request (streamable-http)
 
-Flow:
-- Tool called -> uses ctx.session_id (sid)
-- If no token for sid -> returns login URL: {SERVER_URL}/login?sid=<sid>
-- /login starts OAuth -> stores pending state -> redirects to Blackboard authorize endpoint
-- /oauth/callback exchanges code for token -> stores token under bb:session:<sid>
-- Subsequent tool calls reuse token
-
-Env:
-  BLACKBOARD_URL=https://<bb-host>              (no trailing slash)
-  BLACKBOARD_APP_KEY=<client_id>
-  BLACKBOARD_APP_SECRET=<client_secret>
-  SERVER_URL=https://<your-fastmcp-host>        (no trailing slash)
-  UPSTASH_REDIS_REST_URL=...
-  UPSTASH_REDIS_REST_TOKEN=...
+Env vars required:
+  BLACKBOARD_URL               e.g. https://anthropic.bt-retool.shop
+  BLACKBOARD_APP_KEY           client_id
+  BLACKBOARD_APP_SECRET        client_secret
+  SERVER_URL                   e.g. https://your-fastmcp-cloud-host
+  UPSTASH_REDIS_REST_URL
+  UPSTASH_REDIS_REST_TOKEN
 
 Optional:
-  OAUTH_REDIRECT_PATH=oauth/callback   (default). Set to "" if Blackboard only allows host-level redirect_uri.
+  OAUTH_REDIRECT_PATH          default: "oauth/callback"
+                               set to "" if Blackboard only allows host-level redirect_uri
 """
 
 import os
@@ -30,8 +27,6 @@ import httpx
 from urllib.parse import quote
 
 from fastmcp import FastMCP
-from fastmcp.dependencies import CurrentContext
-from fastmcp.server.context import Context
 from starlette.responses import RedirectResponse, JSONResponse
 from upstash_redis import Redis
 
@@ -55,36 +50,34 @@ SERVER_URL = (os.environ.get("SERVER_URL") or "").rstrip("/")
 UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
-# If Blackboard doesn't accept full-path redirect URIs, set this to "" (empty).
+# If Blackboard only supports host-level redirect_uri, set this to "" (empty)
 OAUTH_REDIRECT_PATH = (os.environ.get("OAUTH_REDIRECT_PATH") or "oauth/callback").strip("/")
+REDIRECT_URI = f"{SERVER_URL}/{OAUTH_REDIRECT_PATH}" if OAUTH_REDIRECT_PATH else SERVER_URL
 
-TOKEN_EXPIRY = 3600
+# Expiries
+DEFAULT_TOKEN_EXPIRY = 3600  # fallback if expires_in missing
 PENDING_EXPIRY = 600
 
 # Redis keys
-PREFIX_SESSION = "bb:session:"       # bb:session:<sid> -> token record
-PREFIX_PENDING = "bb:pending:"       # bb:pending:<state> -> {sid, redirect_uri, ts}
-PREFIX_COMPLETED = "bb:completed:"   # optional guard against double-callback
-
-REDIRECT_URI = f"{SERVER_URL}/{OAUTH_REDIRECT_PATH}" if OAUTH_REDIRECT_PATH else SERVER_URL
+KEY_CURRENT_TOKEN = "bb:token:current"
+PREFIX_PENDING = "bb:pending:"
+PREFIX_COMPLETED = "bb:completed:"
 
 
 def _require_env():
     missing = []
-    if not BLACKBOARD_URL:
-        missing.append("BLACKBOARD_URL")
-    if not BLACKBOARD_APP_KEY:
-        missing.append("BLACKBOARD_APP_KEY")
-    if not BLACKBOARD_APP_SECRET:
-        missing.append("BLACKBOARD_APP_SECRET")
-    if not SERVER_URL:
-        missing.append("SERVER_URL")
-    if not UPSTASH_REDIS_REST_URL:
-        missing.append("UPSTASH_REDIS_REST_URL")
-    if not UPSTASH_REDIS_REST_TOKEN:
-        missing.append("UPSTASH_REDIS_REST_TOKEN")
+    for k, v in [
+        ("BLACKBOARD_URL", BLACKBOARD_URL),
+        ("BLACKBOARD_APP_KEY", BLACKBOARD_APP_KEY),
+        ("BLACKBOARD_APP_SECRET", BLACKBOARD_APP_SECRET),
+        ("SERVER_URL", SERVER_URL),
+        ("UPSTASH_REDIS_REST_URL", UPSTASH_REDIS_REST_URL),
+        ("UPSTASH_REDIS_REST_TOKEN", UPSTASH_REDIS_REST_TOKEN),
+    ]:
+        if not v:
+            missing.append(k)
     if missing:
-        raise RuntimeError("Missing required env vars: " + ", ".join(missing))
+        raise RuntimeError("Missing env vars: " + ", ".join(missing))
 
 
 def _to_str(v):
@@ -101,39 +94,44 @@ def get_redis() -> Redis:
 
 
 # =============================================================================
-# Redis helpers
+# REDIS HELPERS (single-user)
 # =============================================================================
-def store_session_token(sid: str, token_data: dict) -> bool:
+def store_current_token(token_data: dict) -> bool:
+    """Store the single current token record."""
     try:
+        expires_in = int(token_data.get("expires_in") or DEFAULT_TOKEN_EXPIRY)
+        ttl = max(60, min(expires_in, 24 * 3600))  # keep sane bounds
         r = get_redis()
-        r.setex(f"{PREFIX_SESSION}{sid}", TOKEN_EXPIRY, json.dumps(token_data))
-        logger.info(f"Redis: stored token for sid={sid[:8]}…")
+        r.setex(KEY_CURRENT_TOKEN, ttl, json.dumps(token_data))
+        logger.info("Redis: stored current token")
         return True
     except Exception as e:
-        logger.error(f"Redis: failed to store session token: {e}")
+        logger.error(f"Redis: failed to store current token: {e}")
         return False
 
 
-def get_session_token(sid: str) -> dict | None:
+def get_current_token() -> dict | None:
+    """Get the single current token record."""
     try:
         r = get_redis()
-        data = r.get(f"{PREFIX_SESSION}{sid}")
-        data = _to_str(data)
+        data = _to_str(r.get(KEY_CURRENT_TOKEN))
         return json.loads(data) if data else None
     except Exception as e:
-        logger.error(f"Redis: failed to get session token: {e}")
+        logger.error(f"Redis: failed to get current token: {e}")
         return None
 
 
-def delete_session_token(sid: str):
+def delete_current_token():
+    """Delete the single current token record."""
     try:
         r = get_redis()
-        r.delete(f"{PREFIX_SESSION}{sid}")
+        r.delete(KEY_CURRENT_TOKEN)
     except Exception as e:
-        logger.error(f"Redis: failed to delete session token: {e}")
+        logger.error(f"Redis: failed to delete current token: {e}")
 
 
 def store_pending(state: str, auth_data: dict) -> bool:
+    """Store pending OAuth flow info."""
     try:
         r = get_redis()
         r.setex(f"{PREFIX_PENDING}{state}", PENDING_EXPIRY, json.dumps(auth_data))
@@ -144,10 +142,10 @@ def store_pending(state: str, auth_data: dict) -> bool:
 
 
 def get_pending(state: str) -> dict | None:
+    """Get pending OAuth flow info."""
     try:
         r = get_redis()
-        data = r.get(f"{PREFIX_PENDING}{state}")
-        data = _to_str(data)
+        data = _to_str(r.get(f"{PREFIX_PENDING}{state}"))
         return json.loads(data) if data else None
     except Exception as e:
         logger.error(f"Redis: failed to get pending: {e}")
@@ -155,6 +153,7 @@ def get_pending(state: str) -> dict | None:
 
 
 def delete_pending(state: str):
+    """Delete pending OAuth flow info."""
     try:
         r = get_redis()
         r.delete(f"{PREFIX_PENDING}{state}")
@@ -163,6 +162,7 @@ def delete_pending(state: str):
 
 
 def store_completed(state: str, data: dict) -> bool:
+    """Mark an OAuth state as completed (guards double-callback)."""
     try:
         r = get_redis()
         r.setex(f"{PREFIX_COMPLETED}{state}", PENDING_EXPIRY, json.dumps(data))
@@ -173,10 +173,10 @@ def store_completed(state: str, data: dict) -> bool:
 
 
 def get_completed(state: str) -> dict | None:
+    """Check if an OAuth state has already completed."""
     try:
         r = get_redis()
-        data = r.get(f"{PREFIX_COMPLETED}{state}")
-        data = _to_str(data)
+        data = _to_str(r.get(f"{PREFIX_COMPLETED}{state}"))
         return json.loads(data) if data else None
     except Exception as e:
         logger.error(f"Redis: failed to get completed: {e}")
@@ -184,30 +184,30 @@ def get_completed(state: str) -> dict | None:
 
 
 # =============================================================================
-# Auth helpers
+# AUTH URL HELPER
 # =============================================================================
-def auth_link_for_sid(sid: str) -> str:
-    url = f"{SERVER_URL}/login?sid={sid}"
+def get_auth_url() -> str:
     return (
-        "🔐 Authentication Required\n\n"
-        f"Open this link in your browser:\n{url}\n\n"
-        "After you see the success message, come back to Claude and run the tool again."
+        f"🔐 **Authentication Required**\n\n"
+        f"Please log in to Blackboard:\n\n"
+        f"👉 [{SERVER_URL}/login]({SERVER_URL}/login)\n\n"
+        f"After logging in, return here and try again."
     )
 
 
 # =============================================================================
-# MCP server
+# MCP SERVER
 # =============================================================================
 mcp = FastMCP("Blackboard")
 
 
 # =============================================================================
-# Routes
+# ROUTES
 # =============================================================================
 
-# If Blackboard only supports host-level redirect_uri, it may redirect to:
-#   https://your-host/?code=...&state=...
-# This route makes that work by delegating to the same callback handler.
+# If Blackboard only allows host-level redirect_uri, it may redirect to:
+#   https://YOUR_HOST/?code=...&state=...
+# This route catches that and forwards to the same callback handler.
 @mcp.custom_route("/", methods=["GET"])
 async def root(request):
     if request.query_params.get("code") and request.query_params.get("state"):
@@ -217,16 +217,11 @@ async def root(request):
 
 @mcp.custom_route("/login", methods=["GET"])
 async def login_page(request):
-    sid = request.query_params.get("sid")
-    if not sid:
-        return JSONResponse(
-            {"error": "missing_sid", "message": "Open /login from Claude so it includes ?sid=<mcp session id>."},
-            status_code=400,
-        )
+    """Start OAuth flow."""
+    logger.info("Login: starting OAuth flow")
 
     state = secrets.token_urlsafe(32)
     store_pending(state, {
-        "sid": sid,
         "redirect_uri": REDIRECT_URI,
         "timestamp": time.time(),
     })
@@ -240,12 +235,13 @@ async def login_page(request):
         f"&state={state}"
     )
 
-    logger.info(f"Login: sid={sid[:8]}… redirect_uri={REDIRECT_URI}")
+    logger.info(f"Login: redirect_uri={REDIRECT_URI}")
     return RedirectResponse(bb_auth_url)
 
 
 @mcp.custom_route("/login/success", methods=["GET"])
 async def login_success(request):
+    """Success page after login."""
     return JSONResponse({
         "status": "success",
         "message": "✅ Login successful! Close this window and return to Claude."
@@ -254,38 +250,37 @@ async def login_success(request):
 
 @mcp.custom_route("/oauth/callback", methods=["GET"])
 async def oauth_callback(request):
-    logger.info(f"OAuth: callback request.url={request.url}")
-    logger.info(f"OAuth: expected redirect_uri={REDIRECT_URI}")
-
+    """OAuth callback from Blackboard."""
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")
 
+    logger.info(f"OAuth: callback received url={request.url}")
+
     if error:
-        return JSONResponse(
-            {
-                "error": error,
-                "error_description": request.query_params.get("error_description"),
-            },
-            status_code=400,
-        )
+        return JSONResponse({
+            "error": error,
+            "error_description": request.query_params.get("error_description"),
+        }, status_code=400)
 
     if not code or not state:
         return JSONResponse({"error": "missing_parameters"}, status_code=400)
 
-    # Guard duplicate callback
+    # Duplicate callback guard
     if get_completed(state):
         return RedirectResponse(f"{SERVER_URL}/login/success")
 
+    # Validate pending state
     pending = get_pending(state)
     if not pending:
+        # If user refreshed and we already have a token, treat as success
+        if get_current_token():
+            return RedirectResponse(f"{SERVER_URL}/login/success")
         return JSONResponse({"error": "invalid_state"}, status_code=400)
 
-    sid = pending.get("sid")
     redirect_uri = pending.get("redirect_uri") or REDIRECT_URI
-    if not sid:
-        return JSONResponse({"error": "pending_missing_sid"}, status_code=400)
 
+    # Exchange code for token
     try:
         creds = f"{BLACKBOARD_APP_KEY}:{BLACKBOARD_APP_SECRET}"
         auth_header = base64.b64encode(creds.encode()).decode()
@@ -300,35 +295,39 @@ async def oauth_callback(request):
                 data={
                     "grant_type": "authorization_code",
                     "code": code,
-                    "redirect_uri": redirect_uri,  # must match authorize step
-                },
+                    "redirect_uri": redirect_uri,
+                }
             )
 
         if resp.status_code != 200:
-            logger.error(f"OAuth: token exchange failed ({resp.status_code}): {resp.text}")
-            return JSONResponse(
-                {"error": "token_exchange_failed", "status_code": resp.status_code, "details": resp.text},
-                status_code=500,
-            )
+            logger.error(f"OAuth: token exchange failed {resp.status_code}: {resp.text}")
+            return JSONResponse({
+                "error": "token_exchange_failed",
+                "status_code": resp.status_code,
+                "details": resp.text
+            }, status_code=500)
 
         bb_token = resp.json()
+        access_token = bb_token["access_token"]
 
+        expires_in = int(bb_token.get("expires_in", DEFAULT_TOKEN_EXPIRY))
         token_record = {
-            "access_token": bb_token["access_token"],
+            "access_token": access_token,
             "token_type": bb_token.get("token_type", "bearer"),
-            "expires_in": bb_token.get("expires_in", 3600),
+            "expires_in": expires_in,
+            "expires_at": time.time() + expires_in,
             "refresh_token": bb_token.get("refresh_token"),
             "user_id": bb_token.get("user_id", "unknown"),
             "timestamp": time.time(),
         }
 
-        if not store_session_token(sid, token_record):
+        if not store_current_token(token_record):
             return JSONResponse({"error": "redis_store_failed"}, status_code=500)
 
-        store_completed(state, {"user_id": token_record["user_id"]})
+        store_completed(state, {"user_id": token_record.get("user_id")})
         delete_pending(state)
 
-        logger.info(f"OAuth: ✅ stored token for sid={sid[:8]}… user_id={token_record['user_id']}")
+        logger.info(f"OAuth: ✅ stored current token for user_id={token_record.get('user_id')}")
         return RedirectResponse(f"{SERVER_URL}/login/success")
 
     except Exception as e:
@@ -337,159 +336,179 @@ async def oauth_callback(request):
 
 
 # =============================================================================
-# Tools (session-scoped)
+# MCP TOOLS
 # =============================================================================
 @mcp.tool()
-async def check_auth_status(ctx: Context = CurrentContext()) -> str:
-    sid = ctx.session_id
-    token_data = get_session_token(sid)
+async def check_auth_status() -> str:
+    """Check authentication status (single-user)."""
+    token_data = get_current_token()
     if not token_data:
-        return "🔒 Not Authenticated\n\n" + auth_link_for_sid(sid)
+        return "🔒 **Not Authenticated**\n\n" + get_auth_url()
 
+    remaining = int(max(0, token_data.get("expires_at", time.time()) - time.time()))
     return (
-        "✅ Authenticated\n\n"
-        f"• User ID: `{token_data.get('user_id')}`\n"
-        f"• Expires in: ~{token_data.get('expires_in', 3600)//60} minutes\n"
-        f"• Session: `{sid}`"
+        f"✅ **Authenticated**\n\n"
+        f"• **User ID:** `{token_data.get('user_id')}`\n"
+        f"• **Expires in:** ~{remaining // 60} minutes"
     )
 
 
 @mcp.tool()
-async def get_current_user(ctx: Context = CurrentContext()) -> str:
-    sid = ctx.session_id
-    token_data = get_session_token(sid)
+async def get_current_user() -> str:
+    """Get current authenticated Blackboard user info."""
+    token_data = get_current_token()
     if not token_data:
-        return auth_link_for_sid(sid)
+        return get_auth_url()
 
     token = token_data["access_token"]
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(
-            f"{BLACKBOARD_URL}/learn/api/public/v1/users/me",
-            headers={"Authorization": f"Bearer {token}"},
-        )
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{BLACKBOARD_URL}/learn/api/public/v1/users/me",
+                headers={"Authorization": f"Bearer {token}"},
+            )
 
-    if resp.status_code == 401:
-        delete_session_token(sid)
-        return "⚠️ Session expired.\n\n" + auth_link_for_sid(sid)
+        if resp.status_code == 401:
+            delete_current_token()
+            return "⚠️ Session expired.\n\n" + get_auth_url()
 
-    if resp.status_code != 200:
-        return f"Error: {resp.status_code} - {resp.text}"
+        if resp.status_code != 200:
+            return f"Error: {resp.status_code} - {resp.text}"
 
-    user = resp.json()
-    name = user.get("name", {}) or {}
+        user = resp.json()
+        name = user.get("name", {}) or {}
 
-    out = "👤 Current User\n\n"
-    out += f"• User ID: `{user.get('id')}`\n"
-    out += f"• Username: `{user.get('userName')}`\n"
-    if name.get("given") or name.get("family"):
-        out += f"• Name: {name.get('given','')} {name.get('family','')}\n"
-    email = (user.get("contact", {}) or {}).get("email")
-    if email:
-        out += f"• Email: {email}\n"
-    return out
+        result = "👤 **Current User**\n\n"
+        result += f"• **User ID:** `{user.get('id')}`\n"
+        result += f"• **Username:** `{user.get('userName')}`\n"
+        if name.get("given") or name.get("family"):
+            result += f"• **Name:** {name.get('given','')} {name.get('family','')}\n"
+        email = (user.get("contact", {}) or {}).get("email")
+        if email:
+            result += f"• **Email:** {email}\n"
+        return result
 
-@mcp.tool()
-async def whoami_session(ctx: Context = CurrentContext()) -> dict:
-    return {
-        "transport": ctx.transport,
-        "session_id": ctx.session_id,
-        "request_id": ctx.request_id,
-        "client_id": ctx.client_id,
-    }
+    except Exception as e:
+        return f"Error: {str(e)}"
+
 
 @mcp.tool()
-async def get_my_courses(ctx: Context = CurrentContext()) -> str:
-    sid = ctx.session_id
-    token_data = get_session_token(sid)
+async def get_my_courses() -> str:
+    """Get all courses you have access to in Blackboard."""
+    token_data = get_current_token()
     if not token_data:
-        return auth_link_for_sid(sid)
+        return get_auth_url()
 
     token = token_data["access_token"]
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(
-            f"{BLACKBOARD_URL}/learn/api/public/v1/courses?limit=100",
-            headers={"Authorization": f"Bearer {token}"},
-        )
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{BLACKBOARD_URL}/learn/api/public/v1/courses?limit=100",
+                headers={"Authorization": f"Bearer {token}"},
+            )
 
-    if resp.status_code == 401:
-        delete_session_token(sid)
-        return "⚠️ Session expired.\n\n" + auth_link_for_sid(sid)
+        if resp.status_code == 401:
+            delete_current_token()
+            return "⚠️ Session expired.\n\n" + get_auth_url()
 
-    if resp.status_code != 200:
-        return f"Error: {resp.status_code} - {resp.text}"
+        if resp.status_code != 200:
+            return f"Error: {resp.status_code} - {resp.text}"
 
-    courses = resp.json().get("results", []) or []
-    if not courses:
-        return "No courses found."
+        courses = (resp.json() or {}).get("results", []) or []
+        if not courses:
+            return "No courses found."
 
-    out = f"📚 Found {len(courses)} courses:\n\n"
-    for c in courses:
-        out += f"• **{c.get('name','Unnamed')}** (ID: `{c.get('id')}`)\n"
-    return out
+        result = f"📚 Found {len(courses)} courses:\n\n"
+        for c in courses:
+            result += f"• **{c.get('name','Unnamed')}** (ID: `{c.get('id')}`)\n"
+        return result
+
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 
 @mcp.tool()
-async def get_course_assignments(course_id: str, ctx: Context = CurrentContext()) -> str:
-    sid = ctx.session_id
-    token_data = get_session_token(sid)
+async def get_course_assignments(course_id: str) -> str:
+    """Get assignments for a specific course."""
+    token_data = get_current_token()
     if not token_data:
-        return auth_link_for_sid(sid)
+        return get_auth_url()
 
     token = token_data["access_token"]
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(
-            f"{BLACKBOARD_URL}/learn/api/public/v1/courses/{course_id}/gradebook/columns",
-            headers={"Authorization": f"Bearer {token}"},
-        )
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{BLACKBOARD_URL}/learn/api/public/v1/courses/{course_id}/gradebook/columns",
+                headers={"Authorization": f"Bearer {token}"},
+            )
 
-    if resp.status_code == 401:
-        delete_session_token(sid)
-        return "⚠️ Session expired.\n\n" + auth_link_for_sid(sid)
+        if resp.status_code == 401:
+            delete_current_token()
+            return "⚠️ Session expired.\n\n" + get_auth_url()
 
-    if resp.status_code != 200:
-        return f"Error: {resp.status_code} - {resp.text}"
+        if resp.status_code != 200:
+            return f"Error: {resp.status_code} - {resp.text}"
 
-    cols = resp.json().get("results", []) or []
-    assignments = [c for c in cols if c.get("grading", {}).get("due")]
+        columns = (resp.json() or {}).get("results", []) or []
+        assignments = [c for c in columns if (c.get("grading", {}) or {}).get("due")]
 
-    if not assignments:
-        return f"No assignments with due dates in course `{course_id}`"
+        if not assignments:
+            return f"No assignments with due dates in course `{course_id}`"
 
-    out = f"📝 Found {len(assignments)} assignments:\n\n"
-    for a in assignments:
-        out += (
-            f"• **{a.get('name')}** "
-            f"({a.get('score', {}).get('possible', '?')} pts) - "
-            f"Due: {a.get('grading', {}).get('due')}\n"
-        )
-    return out
+        result = f"📝 Found {len(assignments)} assignments:\n\n"
+        for a in assignments:
+            result += (
+                f"• **{a.get('name')}** "
+                f"({(a.get('score', {}) or {}).get('possible', '?')} pts) - "
+                f"Due: {(a.get('grading', {}) or {}).get('due')}\n"
+            )
+        return result
 
-
-@mcp.tool()
-async def logout(ctx: Context = CurrentContext()) -> str:
-    delete_session_token(ctx.session_id)
-    return "✅ Logged out for this Claude session."
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 
 @mcp.tool()
-async def debug_session(ctx: Context = CurrentContext()) -> str:
-    sid = ctx.session_id
-    out = "🔧 Debug Info\n\n"
-    out += f"• Transport: `{ctx.transport}`\n"
-    out += f"• Session ID: `{sid}`\n"
-    out += f"• Redirect URI: `{REDIRECT_URI}`\n\n"
+async def logout() -> str:
+    """Log out from Blackboard (single-user)."""
+    if get_current_token():
+        delete_current_token()
+        return "✅ Logged out successfully."
+    return "ℹ️ Not currently logged in."
 
+
+@mcp.tool()
+async def check_config() -> str:
+    """Check server configuration."""
+    redis_ok = "❌"
+    try:
+        get_redis().ping()
+        redis_ok = "✅"
+    except Exception:
+        pass
+
+    return (
+        f"⚙️ **Configuration**\n\n"
+        f"• **Blackboard:** `{BLACKBOARD_URL}`\n"
+        f"• **App Key:** `{BLACKBOARD_APP_KEY[:8] if BLACKBOARD_APP_KEY else 'NOT SET'}...`\n"
+        f"• **Server URL:** `{SERVER_URL}`\n"
+        f"• **Redirect URI:** `{REDIRECT_URI}`\n"
+        f"• **Redis:** {redis_ok}\n"
+    )
+
+
+@mcp.tool()
+async def debug_storage() -> str:
+    """Debug token presence in Redis (single-user)."""
+    out = "🔧 **Storage Debug**\n\n"
     try:
         r = get_redis()
         r.ping()
         out += "• Redis: ✅ Connected\n"
-        token_data = get_session_token(sid)
-        out += f"• Has token for this session: {'✅' if token_data else '❌'}\n"
+        token_data = get_current_token()
+        out += f"• Has current token: {'✅' if token_data else '❌'}\n"
         if token_data:
-            out += f"• User ID: `{token_data.get('user_id')}`\n"
-    except Exception as e:
-        out += f"• Redis: ❌ {e}\n"
-    return out
+            out += f"• User ID: `{token_data._
