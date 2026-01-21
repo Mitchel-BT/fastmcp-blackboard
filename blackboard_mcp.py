@@ -389,6 +389,14 @@ async def get_current_user(ctx: Context = CurrentContext()) -> str:
         out += f"• Email: {email}\n"
     return out
 
+@mcp.tool()
+async def whoami_session(ctx: Context = CurrentContext()) -> dict:
+    return {
+        "transport": ctx.transport,
+        "session_id": ctx.session_id,
+        "request_id": ctx.request_id,
+        "client_id": ctx.client_id,
+    }
 
 @mcp.tool()
 async def get_my_courses(ctx: Context = CurrentContext()) -> str:
