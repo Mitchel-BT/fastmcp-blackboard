@@ -110,7 +110,7 @@ def success_page(token: str, user_id: str) -> str:
                 <div class="copy-message-box">
                     Here's my Blackboard access token: <code>{masked_token}</code>
                 </div>
-                <button class="btn btn-copy" onclick="copyMessage()">📋 Copy Message to Clipboard</button>
+                <button class="btn btn-copy" onclick="copyToClipboard()">📋 Copy Message to Clipboard</button>
             </div>
             
             <div class="step-section" style="background: #eff6ff; border-color: #93c5fd;">
@@ -136,11 +136,11 @@ def success_page(token: str, user_id: str) -> str:
         <div class="copied-toast" id="toast">✓ Copied! Now paste it in Claude</div>
         
         <script>
-            const actualToken = "{token}";
-            const copyMessage = "Here's my Blackboard access token: " + actualToken;
+            const token = "{token}";
+            const message = "Here's my Blackboard access token: " + token;
             
-            function copyMessage() {{
-                navigator.clipboard.writeText(copyMessage).then(() => {{
+            function copyToClipboard() {{
+                navigator.clipboard.writeText(message).then(() => {{
                     const toast = document.getElementById('toast');
                     toast.classList.add('show');
                     setTimeout(() => toast.classList.remove('show'), 3000);
