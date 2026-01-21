@@ -48,17 +48,19 @@ PREFIX_COMPLETED = "bb:completed:"
 # ============================================================================
 # REDIS CLIENT
 # ============================================================================
-_redis = None
 
 def get_redis() -> redis.Redis:
-    """Get or create Redis client"""
-    global _redis
-    if _redis is None:
-        if not REDIS_URL:
-            raise RuntimeError("REDIS_URL environment variable is required")
-        _redis = redis.from_url(REDIS_URL, decode_responses=True)
-        logger.info(f"Redis: Connected")
-    return _redis
+    """Create a fresh Redis connection for each operation (serverless-friendly)"""
+    if not REDIS_URL:
+        raise RuntimeError("REDIS_URL environment variable is required")
+    # Create fresh connection each time - works better in serverless
+    client = redis.from_url(
+        REDIS_URL, 
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=5
+    )
+    return client
 
 
 # ============================================================================
