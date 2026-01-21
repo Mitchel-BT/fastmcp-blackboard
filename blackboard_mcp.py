@@ -1,6 +1,6 @@
 """
 Blackboard MCP Server - Cloud Version with Custom OAuth
-Adapts the working local OAuth flow for FastMCP Cloud
+Provides authentication links directly in tool responses
 """
 import os
 import base64
@@ -31,6 +31,96 @@ _tokens = {}
 
 
 # ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def get_auth_link() -> str:
+    """Generate an authentication link for the user"""
+    our_state = secrets.token_urlsafe(32)
+    
+    _pending_auths[our_state] = {
+        "timestamp": time.time()
+    }
+    
+    callback_uri = f"{SERVER_URL}/oauth/callback"
+    
+    blackboard_auth_url = (
+        f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode"
+        f"?response_type=code"
+        f"&client_id={BLACKBOARD_APP_KEY}"
+        f"&redirect_uri={quote(callback_uri, safe='')}"
+        f"&scope=read+write+offline"
+        f"&state={our_state}"
+    )
+    
+    return blackboard_auth_url
+
+
+def get_access_token() -> str | None:
+    """Get a valid access token if available"""
+    # Check if we have any tokens stored
+    if not _tokens:
+        return None
+    
+    # Get the most recent token
+    latest_token = max(_tokens.values(), key=lambda x: x['timestamp'])
+    
+    # Check if token is expired (with 5 minute buffer)
+    age = time.time() - latest_token['timestamp']
+    if age > (latest_token.get('expires_in', 3600) - 300):
+        return None
+    
+    return latest_token['access_token']
+
+
+async def make_blackboard_request(endpoint: str, method: str = "GET", **kwargs):
+    """Make an authenticated request to Blackboard API"""
+    token = get_access_token()
+    
+    if not token:
+        auth_url = get_auth_link()
+        return {
+            "error": "authentication_required",
+            "message": "Please authenticate with Blackboard by clicking this link:",
+            "auth_url": auth_url
+        }
+    
+    url = f"{BLACKBOARD_URL}/learn/api/public/v1/{endpoint}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        **kwargs.pop("headers", {})
+    }
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.request(method, url, headers=headers, **kwargs)
+            
+            if response.status_code == 401:
+                # Token expired or invalid
+                auth_url = get_auth_link()
+                return {
+                    "error": "authentication_required",
+                    "message": "Your session has expired. Please authenticate again:",
+                    "auth_url": auth_url
+                }
+            
+            response.raise_for_status()
+            return response.json()
+            
+    except httpx.HTTPStatusError as e:
+        return {
+            "error": "api_error",
+            "message": f"Blackboard API error: {e.response.status_code}",
+            "details": e.response.text
+        }
+    except Exception as e:
+        return {
+            "error": "request_failed",
+            "message": str(e)
+        }
+
+
+# ============================================================================
 # OAUTH ROUTES
 # ============================================================================
 
@@ -47,37 +137,6 @@ async def oauth_config(request):
     })
 
 
-@mcp.custom_route("/oauth/start", methods=["GET"])
-async def oauth_start(request):
-    """Generate and return an authorization URL for the user to click"""
-    # Generate state to track this flow
-    our_state = secrets.token_urlsafe(32)
-    
-    # Store minimal info - we'll get the rest when callback happens
-    _pending_auths[our_state] = {
-        "timestamp": time.time()
-    }
-    
-    # Build the Blackboard auth URL
-    callback_uri = f"{SERVER_URL}/oauth/callback"
-    
-    blackboard_auth_url = (
-        f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode"
-        f"?response_type=code"
-        f"&client_id={BLACKBOARD_APP_KEY}"
-        f"&redirect_uri={quote(callback_uri, safe='')}"
-        f"&scope=read+write+offline"
-        f"&state={our_state}"
-    )
-    
-    print(f"[OAuth Start] Generated auth URL")
-    
-    return JSONResponse({
-        "auth_url": blackboard_auth_url,
-        "message": "Please click this link to authenticate with Blackboard"
-    })
-
-
 @mcp.custom_route("/oauth/authorize", methods=["GET"])
 async def oauth_authorize(request):
     """OAuth authorization endpoint - redirects immediately to Blackboard"""
@@ -87,9 +146,7 @@ async def oauth_authorize(request):
     code_challenge = request.query_params.get("code_challenge")
     
     print(f"[OAuth] Authorization request")
-    print(f"[OAuth] Redirect URI: {redirect_uri}")
     
-    # Generate state to track this flow
     our_state = secrets.token_urlsafe(32)
     
     _pending_auths[our_state] = {
@@ -100,7 +157,6 @@ async def oauth_authorize(request):
         "timestamp": time.time()
     }
     
-    # Build the Blackboard auth URL with proper encoding
     callback_uri = f"{SERVER_URL}/oauth/callback"
     
     blackboard_auth_url = (
@@ -112,9 +168,6 @@ async def oauth_authorize(request):
         f"&state={our_state}"
     )
     
-    print(f"[OAuth] Redirecting to: {blackboard_auth_url[:100]}...")
-    
-    # Redirect directly to Blackboard
     return RedirectResponse(blackboard_auth_url)
 
 
@@ -148,7 +201,6 @@ async def oauth_callback(request):
             <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
                 <h1>❌ Error</h1>
                 <p>Missing required parameters</p>
-                <p>You can close this window and try again.</p>
             </body>
             </html>
             """, 
@@ -163,7 +215,6 @@ async def oauth_callback(request):
             <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
                 <h1>❌ Error</h1>
                 <p>Invalid or expired authentication session</p>
-                <p>You can close this window and try again.</p>
             </body>
             </html>
             """, 
@@ -173,7 +224,6 @@ async def oauth_callback(request):
     del _pending_auths[state]
     
     try:
-        # Exchange with Blackboard
         print(f"[Callback] Exchanging code...")
         
         credentials = f"{BLACKBOARD_APP_KEY}:{BLACKBOARD_APP_SECRET}"
@@ -201,7 +251,6 @@ async def oauth_callback(request):
                     <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
                         <h1>❌ Token Exchange Failed</h1>
                         <p>{response.text}</p>
-                        <p>You can close this window and try again.</p>
                     </body>
                     </html>
                     """, 
@@ -211,7 +260,6 @@ async def oauth_callback(request):
             token_data = response.json()
             print(f"[Callback] Got token from Blackboard")
         
-        # Generate code for Claude
         claude_code = secrets.token_urlsafe(32)
         
         _tokens[claude_code] = {
@@ -223,13 +271,11 @@ async def oauth_callback(request):
             "timestamp": time.time()
         }
         
-        # If we have the original redirect_uri (from Claude), redirect back
         if original.get("redirect_uri"):
             redirect_url = f"{original['redirect_uri']}?code={claude_code}&state={original['state']}"
             print(f"[Callback] Redirecting to Claude")
             return RedirectResponse(redirect_url)
         else:
-            # Otherwise, show success page
             return HTMLResponse(
                 """
                 <html>
@@ -250,7 +296,6 @@ async def oauth_callback(request):
             <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
                 <h1>❌ Error</h1>
                 <p>{str(e)}</p>
-                <p>You can close this window and try again.</p>
             </body>
             </html>
             """, 
@@ -283,10 +328,6 @@ async def oauth_token(request):
     })
 
 
-# ============================================================================
-# MIDDLEWARE TO REQUIRE AUTH
-# ============================================================================
-
 @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
 async def protected_resource_config(request):
     """Indicate that this resource requires OAuth"""
@@ -297,47 +338,67 @@ async def protected_resource_config(request):
 
 
 # ============================================================================
-# MCP TOOLS (These will automatically require authentication)
+# MCP TOOLS
 # ============================================================================
 
 @mcp.tool()
-async def get_my_courses() -> str:
+async def get_my_courses() -> dict:
     """
     Get all courses you have access to in Blackboard.
-    This will prompt for authentication if needed.
+    Returns authentication link if not logged in.
     """
-    # Claude will automatically inject the access token
-    # For now, return instructions
-    return (
-        "To use this tool, Claude needs to authenticate with Blackboard first.\n"
-        "You should be prompted to log in. If not, try reconnecting the MCP server."
-    )
+    result = await make_blackboard_request("courses")
+    
+    if isinstance(result, dict) and result.get("error") == "authentication_required":
+        return result
+    
+    # Format courses nicely
+    if isinstance(result, dict) and "results" in result:
+        courses = result["results"]
+        return {
+            "success": True,
+            "courses": courses,
+            "count": len(courses)
+        }
+    
+    return result
 
 
 @mcp.tool()
-async def get_course_assignments(course_id: str) -> str:
+async def get_course_assignments(course_id: str) -> dict:
     """
     Get assignments for a specific course.
     
     Args:
         course_id: The course ID from get_my_courses (e.g., "_123_1")
     """
-    return f"Getting assignments for course {course_id}..."
+    result = await make_blackboard_request(f"courses/{course_id}/contents")
+    
+    if isinstance(result, dict) and result.get("error") == "authentication_required":
+        return result
+    
+    return result
 
 
 @mcp.tool()
 async def check_config() -> str:
     """Check server configuration and OAuth endpoints"""
+    token_status = "No tokens stored"
+    if _tokens:
+        latest = max(_tokens.values(), key=lambda x: x['timestamp'])
+        age = int(time.time() - latest['timestamp'])
+        token_status = f"Token exists (age: {age}s, user: {latest.get('user_id', 'N/A')})"
+    
     return (
         f"Blackboard URL: {BLACKBOARD_URL}\n"
         f"App Key: {BLACKBOARD_APP_KEY[:8]}...\n"
         f"Server URL: {SERVER_URL}\n"
+        f"\nToken Status: {token_status}\n"
         f"\nOAuth Endpoints:\n"
         f"- Discovery: {SERVER_URL}/.well-known/oauth-authorization-server\n"
         f"- Authorize: {SERVER_URL}/oauth/authorize\n"
         f"- Token: {SERVER_URL}/oauth/token\n"
         f"- Callback: {SERVER_URL}/oauth/callback\n"
-        f"- Start: {SERVER_URL}/oauth/start\n"
     )
 
 
@@ -349,6 +410,12 @@ async def debug_tokens() -> str:
     
     token_info = []
     for code, data in _tokens.items():
-        token_info.append(f"Code: {code[:16]}... | User: {data.get('user_id', 'N/A')} | Age: {int(time.time() - data['timestamp'])}s")
+        age = int(time.time() - data['timestamp'])
+        expires_in = data.get('expires_in', 3600)
+        status = "expired" if age > expires_in else "valid"
+        token_info.append(
+            f"Code: {code[:16]}... | User: {data.get('user_id', 'N/A')} | "
+            f"Age: {age}s / {expires_in}s | Status: {status}"
+        )
     
     return "\n".join(token_info)
