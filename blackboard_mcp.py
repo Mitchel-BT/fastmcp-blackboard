@@ -1,9 +1,45 @@
 """
-Enhanced Blackboard MCP Server with Session Management for Demo
-Includes tools to logout, switch users, and manage multiple sessions
+Blackboard MCP Server - Cloud Version with Correct OAuth Flow
+Fixed to match Blackboard's 3-Legged OAuth specification
 """
+import os
+import base64
+import secrets
+import time
+import logging
+import httpx
+from urllib.parse import urlencode
+from fastmcp import FastMCP, Context
+from fastmcp.server.middleware import Middleware, MiddlewareContext
+from fastmcp.server.dependencies import get_context
+from starlette.responses import RedirectResponse, JSONResponse
 
-# ... (keep all your existing imports and configuration)
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("blackboard-mcp")
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL")  # e.g., https://your-school.blackboard.com
+BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY")
+BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET")
+SERVER_URL = os.environ.get("SERVER_URL")
+
+TOKEN_EXPIRY_SECONDS = 3600
+
+# ============================================================================
+# SESSION STORAGE - Per Connection
+# ============================================================================
+_sessions = {}  # connection_id -> {token_data, timestamp, user_id}
+_pending_auths = {}  # state -> {connection_id, redirect_uri, etc}
+_auth_codes = {}  # code -> {connection_id, token_data}
+_completed_states = {}  # state -> cached redirect info
 
 # ============================================================================
 # ENHANCED SESSION MANAGEMENT
