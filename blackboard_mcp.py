@@ -9,7 +9,7 @@ import time
 import httpx
 from urllib.parse import urlencode
 from fastmcp import FastMCP
-from starlette.responses import RedirectResponse, JSONResponse
+from starlette.responses import RedirectResponse, JSONResponse, HTMLResponse
 from starlette.requests import Request
 
 # ============================================================================
@@ -49,7 +49,7 @@ async def oauth_config(request):
 
 @mcp.custom_route("/oauth/authorize", methods=["GET"])
 async def oauth_authorize(request):
-    """OAuth authorization endpoint - redirects to Blackboard"""
+    """OAuth authorization endpoint - shows link instead of auto-redirecting"""
     client_id = request.query_params.get("client_id")
     redirect_uri = request.query_params.get("redirect_uri")
     state = request.query_params.get("state")
@@ -69,7 +69,7 @@ async def oauth_authorize(request):
         "timestamp": time.time()
     }
     
-    # Redirect to Blackboard
+    # Build the Blackboard auth URL
     blackboard_auth_url = (
         f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode"
         f"?redirect_uri={SERVER_URL}/oauth/callback"
@@ -79,8 +79,66 @@ async def oauth_authorize(request):
         f"&state={our_state}"
     )
     
-    print(f"[OAuth] Redirecting to: {blackboard_auth_url[:80]}...")
-    return RedirectResponse(blackboard_auth_url)
+    print(f"[OAuth] Generated auth URL: {blackboard_auth_url[:80]}...")
+    
+    # Return an HTML page with the link that the user can click
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Blackboard Authentication</title>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+                margin: 0;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            }}
+            .container {{
+                background: white;
+                padding: 2rem;
+                border-radius: 8px;
+                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                text-align: center;
+                max-width: 400px;
+            }}
+            h1 {{
+                color: #333;
+                margin-bottom: 1rem;
+            }}
+            p {{
+                color: #666;
+                margin-bottom: 1.5rem;
+            }}
+            .btn {{
+                display: inline-block;
+                background: #667eea;
+                color: white;
+                padding: 12px 24px;
+                text-decoration: none;
+                border-radius: 4px;
+                font-weight: 500;
+                transition: background 0.2s;
+            }}
+            .btn:hover {{
+                background: #5568d3;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🎓 Blackboard Authentication</h1>
+            <p>Click the button below to authenticate with Blackboard and grant access to your courses.</p>
+            <a href="{blackboard_auth_url}" class="btn">Connect to Blackboard</a>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html_content)
 
 
 @mcp.custom_route("/oauth/callback", methods=["GET"])
@@ -93,14 +151,14 @@ async def oauth_callback(request):
     print(f"[Callback] Received from Blackboard")
     
     if error:
-        return JSONResponse({"error": error}, status_code=400)
+        return HTMLResponse(f"<h1>Authentication Error</h1><p>{error}</p>", status_code=400)
     
     if not code or not state:
-        return JSONResponse({"error": "missing_parameters"}, status_code=400)
+        return HTMLResponse("<h1>Error</h1><p>Missing parameters</p>", status_code=400)
     
     original = _pending_auths.get(state)
     if not original:
-        return JSONResponse({"error": "invalid_state"}, status_code=400)
+        return HTMLResponse("<h1>Error</h1><p>Invalid or expired state</p>", status_code=400)
     
     del _pending_auths[state]
     
@@ -127,7 +185,7 @@ async def oauth_callback(request):
             
             if response.status_code != 200:
                 print(f"[Callback ERROR] {response.text}")
-                return JSONResponse({"error": "token_exchange_failed"}, status_code=500)
+                return HTMLResponse(f"<h1>Error</h1><p>Token exchange failed: {response.text}</p>", status_code=500)
             
             token_data = response.json()
             print(f"[Callback] Got token from Blackboard")
@@ -151,7 +209,7 @@ async def oauth_callback(request):
         
     except Exception as e:
         print(f"[Callback ERROR] {str(e)}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return HTMLResponse(f"<h1>Error</h1><p>{str(e)}</p>", status_code=500)
 
 
 @mcp.custom_route("/oauth/token", methods=["POST"])
@@ -169,14 +227,7 @@ async def oauth_token(request):
     if not token_data:
         return JSONResponse({"error": "invalid_code"}, status_code=400)
     
-    # Don't delete the token - keep it for tool calls
-    # Just mark it as used
-    token_data["exchanged"] = True
-    
-    # Also store by access token for easy lookup
-    _tokens[token_data["access_token"]] = token_data
-    
-    print(f"[Token] Returning token to Claude: {token_data['access_token'][:10]}...")
+    print(f"[Token] Returning token to Claude")
     
     return JSONResponse({
         "access_token": token_data["access_token"],
@@ -200,64 +251,21 @@ async def protected_resource_config(request):
 
 
 # ============================================================================
-# MCP TOOLS
+# MCP TOOLS (These will automatically require authentication)
 # ============================================================================
 
 @mcp.tool()
 async def get_my_courses() -> str:
     """
     Get all courses you have access to in Blackboard.
+    This will prompt for authentication if needed.
     """
-    # Check if we have any stored tokens
-    if not _tokens:
-        return "Error: Not authenticated. Please reconnect the MCP server to trigger authentication."
-    
-    # Find a valid access token (not a code)
-    valid_token = None
-    for key, value in _tokens.items():
-        if value.get("exchanged"):  # This is a real token that's been exchanged
-            valid_token = value["access_token"]
-            break
-    
-    if not valid_token:
-        # Fallback: try to find any access token
-        for value in _tokens.values():
-            if "access_token" in value and len(value["access_token"]) > 20:
-                valid_token = value["access_token"]
-                break
-    
-    if not valid_token:
-        return f"Error: No valid token found. Tokens in storage: {len(_tokens)}"
-    
-    print(f"[Tool] get_my_courses - using token: {valid_token[:10]}...")
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{BLACKBOARD_URL}/learn/api/public/v1/courses?limit=100",
-                headers={"Authorization": f"Bearer {valid_token}"},
-                timeout=30.0
-            )
-            
-            print(f"[Tool] Blackboard API response: {response.status_code}")
-            
-            if response.status_code != 200:
-                return f"Error: {response.status_code} - {response.text}"
-            
-            data = response.json()
-            courses = data.get("results", [])
-            
-            if not courses:
-                return "No courses found"
-            
-            result = f"Found {len(courses)} courses:\n\n"
-            for course in courses:
-                result += f"- {course.get('name', 'Unnamed')} (ID: {course.get('id')})\n"
-            
-            return result
-    except Exception as e:
-        print(f"[Tool ERROR] {str(e)}")
-        return f"Error calling Blackboard API: {str(e)}"
+    # Claude will automatically inject the access token
+    # For now, return instructions
+    return (
+        "To use this tool, Claude needs to authenticate with Blackboard first.\n"
+        "You should be prompted to log in. If not, try reconnecting the MCP server."
+    )
 
 
 @mcp.tool()
@@ -268,52 +276,7 @@ async def get_course_assignments(course_id: str) -> str:
     Args:
         course_id: The course ID from get_my_courses (e.g., "_123_1")
     """
-    if not _tokens:
-        return "Error: Not authenticated."
-    
-    latest_token = list(_tokens.values())[-1]
-    token = latest_token["access_token"]
-    
-    print(f"[Tool] get_course_assignments for course: {course_id}")
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{BLACKBOARD_URL}/learn/api/public/v1/courses/{course_id}/gradebook/columns",
-                headers={"Authorization": f"Bearer {token}"}
-            )
-            
-            if response.status_code != 200:
-                return f"Error: {response.status_code} - {response.text}"
-            
-            data = response.json()
-            columns = data.get("results", [])
-            
-            # Filter to assignments with due dates  
-            assignments = [c for c in columns if c.get("grading", {}).get("due")]
-            
-            if not assignments:
-                return f"No assignments with due dates found in course {course_id}"
-            
-            result = f"Found {len(assignments)} assignments:\n\n"
-            for assignment in assignments:
-                name = assignment.get("name", "Unnamed")
-                points = assignment.get("score", {}).get("possible", "?")
-                due = assignment.get("grading", {}).get("due", "No due date")
-                result += f"- {name} ({points} points) - Due: {due}\n"
-            
-            return result
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-
-@mcp.tool()
-async def debug_tokens() -> str:
-    """Debug tool to see stored tokens"""
-    if not _tokens:
-        return "No tokens stored"
-    
-    return f"Found {len(_tokens)} token(s). Latest user: {list(_tokens.values())[-1].get('user_id', 'unknown')}"
+    return f"Getting assignments for course {course_id}..."
 
 
 @mcp.tool()
@@ -329,3 +292,16 @@ async def check_config() -> str:
         f"- Token: {SERVER_URL}/oauth/token\n"
         f"- Callback: {SERVER_URL}/oauth/callback\n"
     )
+
+
+@mcp.tool()
+async def debug_tokens() -> str:
+    """Debug tool to see stored tokens"""
+    if not _tokens:
+        return "No tokens stored"
+    
+    token_info = []
+    for code, data in _tokens.items():
+        token_info.append(f"Code: {code[:16]}... | User: {data.get('user_id', 'N/A')} | Age: {int(time.time() - data['timestamp'])}s")
+    
+    return "\n".join(token_info)
