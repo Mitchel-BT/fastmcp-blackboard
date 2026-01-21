@@ -1,6 +1,6 @@
 """
-Blackboard MCP Server - Cloud Version with Correct OAuth Flow
-Fixed to match Blackboard's 3-Legged OAuth specification
+Blackboard MCP Server - Cloud Version with FastMCP OAuth Support
+Multi-tenant session management with connection-based isolation
 """
 import os
 import base64
@@ -26,7 +26,7 @@ logger = logging.getLogger("blackboard-mcp")
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL")
+BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL")  # e.g., https://your-school.blackboard.com
 BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY")
 BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET")
 SERVER_URL = os.environ.get("SERVER_URL")
@@ -100,37 +100,55 @@ def get_auth_url(connection_id: str) -> str:
 
 
 # ============================================================================
-# CONNECTION-AWARE MIDDLEWARE
+# CONNECTION-AWARE MIDDLEWARE - FastMCP OAuth Compatible
 # ============================================================================
 
 class ConnectionSessionMiddleware(Middleware):
-    """Tracks sessions per connection_id"""
+    """
+    Middleware that extracts Bearer token from Authorization header.
+    FastMCP OAuth client sends the token we returned from /oauth/token.
+    """
     
     async def on_call_tool(self, context: MiddlewareContext, call_next):
-        """Inject connection-specific session data into context"""
+        """Extract token from Authorization header and load session"""
         tool_name = context.message.name
         
         try:
+            # FastMCP client sends: Authorization: Bearer <connection_id>
+            # We returned connection_id as the access_token in /oauth/token
+            
             request = context.fastmcp_context.request
+            
             connection_id = None
+            auth_header = None
             
-            # Try to get connection_id from various sources
-            if hasattr(request, 'query_params'):
-                connection_id = request.query_params.get('connection_id')
+            # Get Authorization header (primary method for OAuth)
+            if hasattr(request, 'headers'):
+                auth_header = request.headers.get('authorization') or request.headers.get('Authorization')
             
-            if not connection_id and hasattr(request, 'headers'):
-                connection_id = request.headers.get('X-Connection-ID')
-            
-            if not connection_id:
-                connection_id = getattr(request.state, 'connection_id', None)
+            if auth_header and auth_header.startswith('Bearer '):
+                # Extract the token (which is our connection_id)
+                connection_id = auth_header[7:]  # Remove "Bearer " prefix
+                logger.info(f"Middleware: Found Bearer token (connection_id): {connection_id[:20]}...")
+            else:
+                # Fallback to other methods for non-OAuth requests
+                if hasattr(request, 'query_params'):
+                    connection_id = request.query_params.get('connection_id')
+                
+                if not connection_id and hasattr(request, 'headers'):
+                    connection_id = request.headers.get('X-Connection-ID')
+                
                 if not connection_id:
-                    connection_id = secrets.token_urlsafe(16)
-                    request.state.connection_id = connection_id
+                    connection_id = getattr(request.state, 'connection_id', None)
+                    if not connection_id:
+                        connection_id = secrets.token_urlsafe(16)
+                        request.state.connection_id = connection_id
             
             logger.debug(f"Middleware: Tool {tool_name} - connection_id={connection_id[:20]}...")
             
             cleanup_expired()
             
+            # Look up session by connection_id
             session = _sessions.get(connection_id)
             
             if session:
@@ -139,11 +157,11 @@ class ConnectionSessionMiddleware(Middleware):
                 context.fastmcp_context.set_state("token_data", session)
                 context.fastmcp_context.set_state("access_token", session.get("access_token"))
                 context.fastmcp_context.set_state("user_id", session.get("user_id"))
-                logger.info(f"Middleware: ✅ Session found for connection {connection_id[:20]}... (user {session.get('user_id')})")
+                logger.info(f"Middleware: ✅ Session found for {connection_id[:20]}... (user {session.get('user_id')})")
             else:
                 context.fastmcp_context.set_state("connection_id", connection_id)
                 context.fastmcp_context.set_state("authenticated", False)
-                logger.debug(f"Middleware: No session for connection {connection_id[:20]}...")
+                logger.debug(f"Middleware: ⚠️ No session found for {connection_id[:20]}...")
                 
         except Exception as e:
             logger.exception(f"Middleware: Error: {e}")
@@ -187,21 +205,88 @@ def get_user_session() -> tuple[str | None, dict | None, bool, str | None]:
         return None, None, False, None
 
 
+async def refresh_token_if_needed(connection_id: str) -> bool:
+    """
+    Check if token needs refresh and refresh it if necessary.
+    Returns True if token was refreshed.
+    """
+    session = _sessions.get(connection_id)
+    if not session:
+        return False
+    
+    # Check if token is about to expire (within 5 minutes)
+    expires_in = session.get("expires_in", TOKEN_EXPIRY_SECONDS)
+    elapsed = time.time() - session.get("timestamp", 0)
+    remaining = expires_in - elapsed
+    
+    if remaining > 300:  # More than 5 minutes remaining
+        return False
+    
+    # Token expiring soon, try to refresh
+    refresh_token = session.get("refresh_token")
+    if not refresh_token:
+        logger.warning(f"No refresh token available for connection {connection_id[:20]}...")
+        return False
+    
+    try:
+        logger.info(f"Refreshing token for connection {connection_id[:20]}...")
+        
+        credentials = f"{BLACKBOARD_APP_KEY}:{BLACKBOARD_APP_SECRET}"
+        auth_header = base64.b64encode(credentials.encode()).decode()
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/token",
+                headers={
+                    "Authorization": f"Basic {auth_header}",
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token
+                },
+                timeout=30.0
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Token refresh failed: {response.status_code}")
+                return False
+            
+            token_data = response.json()
+            
+            # Update session with new token
+            session["access_token"] = token_data["access_token"]
+            session["expires_in"] = token_data.get("expires_in", 3600)
+            session["timestamp"] = time.time()
+            if "refresh_token" in token_data:
+                session["refresh_token"] = token_data["refresh_token"]
+            
+            _sessions[connection_id] = session
+            logger.info(f"✅ Token refreshed successfully for connection {connection_id[:20]}...")
+            return True
+            
+    except Exception as e:
+        logger.exception(f"Error refreshing token: {e}")
+        return False
+
+
 # ============================================================================
-# OAUTH ROUTES
+# OAUTH ROUTES - FastMCP Compatible
 # ============================================================================
 
 @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
 async def oauth_config(request):
-    """OAuth server configuration"""
+    """OAuth server configuration - FastMCP client compatible"""
     logger.info("OAuth: Server metadata requested")
     return JSONResponse({
         "issuer": SERVER_URL,
         "authorization_endpoint": f"{SERVER_URL}/oauth/authorize",
         "token_endpoint": f"{SERVER_URL}/oauth/token",
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
+        "scopes_supported": ["read", "write", "offline"],
+        "token_endpoint_auth_methods_supported": ["none"],
     })
 
 
@@ -358,12 +443,42 @@ async def oauth_callback(request):
 
 @mcp.custom_route("/oauth/token", methods=["POST"])
 async def oauth_token(request):
-    """Token endpoint for Claude"""
+    """Token endpoint for Claude - returns connection_id as access token"""
     form = await request.form()
     code = form.get("code")
+    grant_type = form.get("grant_type")
     
-    logger.info(f"OAuth: Token request from Claude")
+    logger.info(f"OAuth: Token request from Claude - grant_type={grant_type}")
     
+    if grant_type == "refresh_token":
+        # Handle token refresh
+        refresh_token_value = form.get("refresh_token")
+        
+        # Find session by refresh token (connection_id)
+        connection_id = refresh_token_value
+        
+        if not connection_id or connection_id not in _sessions:
+            logger.error("OAuth: Invalid refresh token")
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        
+        # Attempt to refresh the Blackboard token
+        refreshed = await refresh_token_if_needed(connection_id)
+        
+        if not refreshed:
+            logger.error("OAuth: Token refresh failed")
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        
+        session = _sessions[connection_id]
+        
+        return JSONResponse({
+            "access_token": connection_id,
+            "token_type": "bearer",
+            "expires_in": session["expires_in"],
+            "refresh_token": connection_id,  # Same as access token for our implementation
+            "scope": session.get("scope", "read write offline")
+        })
+    
+    # Normal authorization code flow
     if not code:
         return JSONResponse({"error": "missing_code"}, status_code=400)
     
@@ -384,10 +499,13 @@ async def oauth_token(request):
     user_id = session.get("user_id")
     logger.info(f"OAuth: ✅ Issued token for connection {connection_id[:20] if connection_id else 'unknown'}... (user {user_id})")
     
+    # Return connection_id as access_token
+    # FastMCP client will send this in Authorization: Bearer header
     return JSONResponse({
         "access_token": connection_id,
         "token_type": "bearer",
         "expires_in": session["expires_in"],
+        "refresh_token": connection_id,  # Same as access token for simplicity
         "scope": session.get("scope", "read write offline")
     })
 
@@ -402,7 +520,7 @@ async def protected_resource_config(request):
 
 
 # ============================================================================
-# MCP TOOLS - NOW DEFINED AFTER mcp OBJECT
+# MCP TOOLS - Blackboard API Integration
 # ============================================================================
 
 @mcp.tool()
@@ -415,6 +533,12 @@ async def get_my_courses() -> str:
     
     user_id = token_data.get("user_id", "unknown")
     logger.info(f"Tool: get_my_courses for user {user_id}")
+    
+    # Try to refresh token if needed
+    await refresh_token_if_needed(connection_id)
+    
+    # Get fresh token after potential refresh
+    token = _sessions.get(connection_id, {}).get("access_token", token)
     
     try:
         async with httpx.AsyncClient() as client:
@@ -462,6 +586,10 @@ async def get_course_assignments(course_id: str) -> str:
     if not authenticated or not token:
         return get_auth_url(connection_id)
     
+    # Try to refresh token if needed
+    await refresh_token_if_needed(connection_id)
+    token = _sessions.get(connection_id, {}).get("access_token", token)
+    
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -507,6 +635,10 @@ async def get_current_user() -> str:
     if not authenticated or not token:
         return get_auth_url(connection_id)
     
+    # Try to refresh token if needed
+    await refresh_token_if_needed(connection_id)
+    token = _sessions.get(connection_id, {}).get("access_token", token)
+    
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -546,6 +678,10 @@ async def get_current_user() -> str:
         logger.exception(f"Tool error: {e}")
         return f"Error: {str(e)}"
 
+
+# ============================================================================
+# SESSION MANAGEMENT TOOLS - For Demo & Testing
+# ============================================================================
 
 @mcp.tool()
 async def logout() -> str:
