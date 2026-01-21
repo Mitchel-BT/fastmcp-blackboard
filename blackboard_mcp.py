@@ -2,6 +2,7 @@
 Blackboard MCP Server - Cloud Version with Custom OAuth
 Uses FastMCP middleware for session isolation via Bearer token
 FIXED: State handling and token storage issues
+FIXED: Issue own tokens instead of returning Blackboard tokens
 """
 import os
 import base64
@@ -42,7 +43,7 @@ TOKEN_EXPIRY_SECONDS = 3600
 # Separate storage for different purposes
 _pending_auths = {}  # state -> auth flow data
 _auth_codes = {}     # claude_code -> token_data (temporary, one-time use)
-_tokens = {}         # access_token -> token_data (active sessions)
+_tokens = {}         # OUR access_token -> blackboard token_data (active sessions)
 _completed_states = {}  # Track completed states to handle duplicate callbacks
 
 
@@ -115,8 +116,12 @@ class BlackboardAuthMiddleware(Middleware):
         # Try to get the Authorization header
         try:
             headers = get_http_headers()
-            # Log all headers for debugging
-            logger.debug(f"Middleware: All headers: {dict(headers)}")
+            
+            # Enhanced logging - log ALL headers for debugging
+            logger.debug(f"Middleware: === ALL HEADERS ===")
+            for key, value in headers.items():
+                logger.debug(f"Middleware:   {key}: {value[:50] if isinstance(value, str) and len(value) > 50 else value}")
+            logger.debug(f"Middleware: ===================")
             
             auth_header = headers.get("authorization", "") or headers.get("Authorization", "")
             logger.debug(f"Middleware: Auth header: '{auth_header[:50]}...'" if auth_header else "Middleware: No auth header")
@@ -138,7 +143,8 @@ class BlackboardAuthMiddleware(Middleware):
                     logger.info(f"Middleware: ✅ Authenticated user {token_data.get('user_id')} for tool {context.message.name}")
                 else:
                     logger.warning(f"Middleware: ❌ Token not found in storage. Have {len(_tokens)} tokens stored.")
-                    logger.debug(f"Middleware: Stored token keys: {[k[:20]+'...' for k in _tokens.keys()]}")
+                    logger.debug(f"Middleware: Received token: {token[:30]}...")
+                    logger.debug(f"Middleware: Stored token keys: {[k[:30]+'...' for k in _tokens.keys()]}")
                     context.fastmcp_context.set_state("authenticated", False)
             else:
                 logger.debug("Middleware: No Bearer token in Authorization header")
@@ -168,6 +174,7 @@ def get_user_session() -> tuple[str | None, dict | None, bool]:
     """
     Get the current user's session from context state.
     Returns (access_token, token_data, is_authenticated)
+    Note: access_token here is OUR token, token_data contains Blackboard's token
     """
     try:
         ctx = get_context()
@@ -385,24 +392,20 @@ async def oauth_callback(request):
                 return JSONResponse({"error": "token_exchange_failed", "details": response.text}, status_code=500)
             
             token_data = response.json()
-            access_token = token_data["access_token"]
+            blackboard_access_token = token_data["access_token"]
             user_id = token_data.get("user_id", "unknown")
-            logger.info(f"OAuth: ✅ Successfully obtained token for user {user_id}")
-            logger.debug(f"OAuth: Token: {access_token[:20]}...")
+            logger.info(f"OAuth: ✅ Successfully obtained Blackboard token for user {user_id}")
+            logger.debug(f"OAuth: Blackboard Token: {blackboard_access_token[:20]}...")
         
-        # Store the token immediately in _tokens for session lookup
+        # Store the Blackboard token data (we'll map our own token to this later)
         token_record = {
-            "access_token": access_token,
+            "access_token": blackboard_access_token,  # Blackboard's token
             "token_type": token_data.get("token_type", "bearer"),
             "expires_in": token_data.get("expires_in", 3600),
             "refresh_token": token_data.get("refresh_token"),
             "user_id": user_id,
             "timestamp": time.time()
         }
-        
-        # Store by access_token for middleware lookup
-        _tokens[access_token] = token_record
-        logger.info(f"OAuth: Stored token in _tokens. Total tokens: {len(_tokens)}")
         
         # Generate code for Claude's token exchange
         claude_code = secrets.token_urlsafe(32)
@@ -464,21 +467,21 @@ async def oauth_token(request):
     # Remove the code (one-time use)
     del _auth_codes[code]
     
-    access_token = token_data["access_token"]
+    # Generate OUR OWN token for Claude to use (not Blackboard's token)
+    my_access_token = secrets.token_urlsafe(32)
     
-    # Ensure token is in _tokens (should already be there from callback)
-    if access_token not in _tokens:
-        _tokens[access_token] = token_data
-        logger.info(f"OAuth: Added token to _tokens from token endpoint")
+    # Store the mapping: our token -> Blackboard token data
+    _tokens[my_access_token] = token_data
     
-    logger.info(f"OAuth: ✅ Issued token to Claude for user {token_data.get('user_id')}")
-    logger.info(f"OAuth: Token that Claude will use: {access_token[:20]}...")
+    logger.info(f"OAuth: ✅ Issued OUR token to Claude for user {token_data.get('user_id')}")
+    logger.info(f"OAuth: Our token (Claude will send this): {my_access_token[:20]}...")
+    logger.info(f"OAuth: Maps to Blackboard token: {token_data['access_token'][:20]}...")
     logger.info(f"OAuth: Total tokens in storage: {len(_tokens)}")
     
-    # Return the Blackboard token - Claude will send this as Bearer token
+    # Return OUR token to Claude (not Blackboard's)
     return JSONResponse({
-        "access_token": access_token,
-        "token_type": token_data["token_type"],
+        "access_token": my_access_token,  # ← OUR token, not Blackboard's
+        "token_type": "bearer",
         "expires_in": token_data["expires_in"],
         "scope": "read write offline"
     })
@@ -506,18 +509,19 @@ async def get_my_courses() -> str:
     """
     token, token_data, authenticated = get_user_session()
     
-    if not authenticated or not token:
+    if not authenticated or not token_data:
         logger.info("Tool get_my_courses: User not authenticated")
         return get_auth_url()
     
-    user_id = token_data.get("user_id", "unknown") if token_data else "unknown"
+    user_id = token_data.get("user_id", "unknown")
+    blackboard_token = token_data.get("access_token")  # Get Blackboard's token
     logger.info(f"Tool get_my_courses: Fetching courses for user {user_id}")
     
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
                 f"{BLACKBOARD_URL}/learn/api/public/v1/courses?limit=100",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"Authorization": f"Bearer {blackboard_token}"},  # Use Blackboard's token
                 timeout=30.0
             )
             
@@ -561,18 +565,19 @@ async def get_course_assignments(course_id: str) -> str:
     """
     token, token_data, authenticated = get_user_session()
     
-    if not authenticated or not token:
+    if not authenticated or not token_data:
         logger.info("Tool get_course_assignments: User not authenticated")
         return get_auth_url()
     
-    user_id = token_data.get("user_id", "unknown") if token_data else "unknown"
+    user_id = token_data.get("user_id", "unknown")
+    blackboard_token = token_data.get("access_token")  # Get Blackboard's token
     logger.info(f"Tool get_course_assignments: Fetching assignments for course {course_id}, user {user_id}")
     
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
                 f"{BLACKBOARD_URL}/learn/api/public/v1/courses/{course_id}/gradebook/columns",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"Authorization": f"Bearer {blackboard_token}"},  # Use Blackboard's token
                 timeout=30.0
             )
             
@@ -617,17 +622,18 @@ async def get_current_user() -> str:
     """
     token, token_data, authenticated = get_user_session()
     
-    if not authenticated or not token:
+    if not authenticated or not token_data:
         logger.info("Tool get_current_user: User not authenticated")
         return get_auth_url()
     
+    blackboard_token = token_data.get("access_token")  # Get Blackboard's token
     logger.info("Tool get_current_user: Fetching current user info")
     
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
                 f"{BLACKBOARD_URL}/learn/api/public/v1/users/me",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"Authorization": f"Bearer {blackboard_token}"},  # Use Blackboard's token
                 timeout=30.0
             )
             
