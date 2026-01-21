@@ -1,6 +1,7 @@
 """
-Blackboard MCP Server - Cloud Version with FastMCP OAuth Support
-Multi-tenant session management with connection-based isolation
+Blackboard MCP Server - Cloud Version with Custom OAuth
+Uses FastMCP middleware for session isolation via Bearer token
+FIXED: State handling and token storage issues
 """
 import os
 import base64
@@ -8,17 +9,18 @@ import secrets
 import time
 import logging
 import httpx
-from urllib.parse import urlencode
+from urllib.parse import quote
 from fastmcp import FastMCP, Context
 from fastmcp.server.middleware import Middleware, MiddlewareContext
-from fastmcp.server.dependencies import get_context
+from fastmcp.server.dependencies import get_http_headers, get_context
+from fastmcp.exceptions import ToolError
 from starlette.responses import RedirectResponse, JSONResponse
 
 # ============================================================================
 # LOGGING SETUP
 # ============================================================================
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.DEBUG,  # Changed to DEBUG for more visibility
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("blackboard-mcp")
@@ -26,34 +28,36 @@ logger = logging.getLogger("blackboard-mcp")
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL")  # e.g., https://your-school.blackboard.com
+BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL")
 BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY")
 BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET")
 SERVER_URL = os.environ.get("SERVER_URL")
 
+# Token expiry time (1 hour default from Blackboard)
 TOKEN_EXPIRY_SECONDS = 3600
 
 # ============================================================================
-# SESSION STORAGE - Per Connection
+# TOKEN STORAGE
 # ============================================================================
-_sessions = {}  # connection_id -> {token_data, timestamp, user_id}
-_pending_auths = {}  # state -> {connection_id, redirect_uri, etc}
-_auth_codes = {}  # code -> {connection_id, token_data}
-_completed_states = {}  # state -> cached redirect info
+# Separate storage for different purposes
+_pending_auths = {}  # state -> auth flow data
+_auth_codes = {}     # claude_code -> token_data (temporary, one-time use)
+_tokens = {}         # access_token -> token_data (active sessions)
+_completed_states = {}  # Track completed states to handle duplicate callbacks
 
 
 def cleanup_expired():
-    """Remove expired sessions and states"""
+    """Remove expired tokens and states from storage"""
     current_time = time.time()
     
-    expired_sessions = [
-        conn_id for conn_id, session in _sessions.items()
-        if current_time - session.get("timestamp", 0) > session.get("expires_in", TOKEN_EXPIRY_SECONDS)
+    # Clean up expired tokens
+    expired_tokens = [
+        key for key, data in _tokens.items()
+        if current_time - data.get("timestamp", 0) > data.get("expires_in", TOKEN_EXPIRY_SECONDS)
     ]
-    for conn_id in expired_sessions:
-        user_id = _sessions[conn_id].get("user_id", "unknown")
-        del _sessions[conn_id]
-        logger.info(f"Cleaned up expired session for connection {conn_id[:20]}... (user {user_id})")
+    for key in expired_tokens:
+        del _tokens[key]
+        logger.info(f"Cleaned up expired token: {key[:20]}...")
     
     # Clean up old auth codes (10 min expiry)
     expired_codes = [
@@ -62,6 +66,7 @@ def cleanup_expired():
     ]
     for key in expired_codes:
         del _auth_codes[key]
+        logger.debug(f"Cleaned up expired auth code")
     
     # Clean up old pending auths (10 min expiry)
     expired_pending = [
@@ -70,6 +75,7 @@ def cleanup_expired():
     ]
     for key in expired_pending:
         del _pending_auths[key]
+        logger.debug(f"Cleaned up expired pending auth")
     
     # Clean up old completed states (10 min expiry)
     expired_completed = [
@@ -80,156 +86,282 @@ def cleanup_expired():
         del _completed_states[key]
 
 
-def get_auth_url(connection_id: str) -> str:
-    """Generate authentication URL with connection context"""
-    params = {
-        'client_id': 'claude',
-        'redirect_uri': f'{SERVER_URL}/oauth/callback',
-        'response_type': 'code',
-        'state': connection_id,
-        'scope': 'read write offline'
-    }
-    auth_url = f"{SERVER_URL}/oauth/authorize?{urlencode(params)}"
-    
+def get_auth_url() -> str:
+    """Generate the authentication URL for users to log in"""
+    # Generate a unique state for this auth request to prevent duplicates
+    auth_state = secrets.token_urlsafe(16)
     return (
         f"🔐 **Authentication Required**\n\n"
-        f"Please log in to Blackboard:\n\n"
-        f"👉 [Click here to authenticate]({auth_url})\n\n"
+        f"Please log in to Blackboard by clicking the link below:\n\n"
+        f"👉 [{SERVER_URL}/login]({SERVER_URL}/login?state={auth_state})\n\n"
         f"After logging in, return here and try your request again."
     )
 
 
 # ============================================================================
-# CONNECTION-AWARE MIDDLEWARE - FastMCP OAuth Compatible
+# AUTHENTICATION MIDDLEWARE
 # ============================================================================
 
-class ConnectionSessionMiddleware(Middleware):
+class BlackboardAuthMiddleware(Middleware):
     """
-    Middleware that extracts Bearer token from Authorization header.
-    FastMCP OAuth client sends the token we returned from /oauth/token.
+    Middleware that extracts Bearer token from Authorization header
+    and loads user session data into context state.
     """
     
     async def on_call_tool(self, context: MiddlewareContext, call_next):
-        """Extract token from Authorization header and load session"""
-        tool_name = context.message.name
+        """Intercept tool calls to inject user session data"""
+        logger.debug(f"Middleware: Processing tool call: {context.message.name}")
         
+        # Try to get the Authorization header
         try:
-            # FastMCP client sends: Authorization: Bearer <connection_id>
-            # We returned connection_id as the access_token in /oauth/token
+            headers = get_http_headers()
+            # Log all headers for debugging
+            logger.debug(f"Middleware: All headers: {dict(headers)}")
             
-            request = context.fastmcp_context.request
+            auth_header = headers.get("authorization", "") or headers.get("Authorization", "")
+            logger.debug(f"Middleware: Auth header: '{auth_header[:50]}...'" if auth_header else "Middleware: No auth header")
             
-            connection_id = None
-            auth_header = None
-            
-            # Get Authorization header (primary method for OAuth)
-            if hasattr(request, 'headers'):
-                auth_header = request.headers.get('authorization') or request.headers.get('Authorization')
-            
-            if auth_header and auth_header.startswith('Bearer '):
-                # Extract the token (which is our connection_id)
-                connection_id = auth_header[7:]  # Remove "Bearer " prefix
-                logger.info(f"Middleware: Found Bearer token (connection_id): {connection_id[:20]}...")
-            else:
-                # Fallback to other methods for non-OAuth requests
-                if hasattr(request, 'query_params'):
-                    connection_id = request.query_params.get('connection_id')
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:]  # Remove "Bearer " prefix
+                logger.info(f"Middleware: Found Bearer token: {token[:20]}...")
                 
-                if not connection_id and hasattr(request, 'headers'):
-                    connection_id = request.headers.get('X-Connection-ID')
+                # Look up the token in our storage
+                cleanup_expired()
+                token_data = _tokens.get(token)
                 
-                if not connection_id:
-                    connection_id = getattr(request.state, 'connection_id', None)
-                    if not connection_id:
-                        connection_id = secrets.token_urlsafe(16)
-                        request.state.connection_id = connection_id
-            
-            logger.debug(f"Middleware: Tool {tool_name} - connection_id={connection_id[:20]}...")
-            
-            cleanup_expired()
-            
-            # Look up session by connection_id
-            session = _sessions.get(connection_id)
-            
-            if session:
-                context.fastmcp_context.set_state("connection_id", connection_id)
-                context.fastmcp_context.set_state("authenticated", True)
-                context.fastmcp_context.set_state("token_data", session)
-                context.fastmcp_context.set_state("access_token", session.get("access_token"))
-                context.fastmcp_context.set_state("user_id", session.get("user_id"))
-                logger.info(f"Middleware: ✅ Session found for {connection_id[:20]}... (user {session.get('user_id')})")
+                if token_data:
+                    # Store session data in context state for tools to access
+                    context.fastmcp_context.set_state("access_token", token)
+                    context.fastmcp_context.set_state("user_id", token_data.get("user_id"))
+                    context.fastmcp_context.set_state("token_data", token_data)
+                    context.fastmcp_context.set_state("authenticated", True)
+                    logger.info(f"Middleware: ✅ Authenticated user {token_data.get('user_id')} for tool {context.message.name}")
+                else:
+                    logger.warning(f"Middleware: ❌ Token not found in storage. Have {len(_tokens)} tokens stored.")
+                    logger.debug(f"Middleware: Stored token keys: {[k[:20]+'...' for k in _tokens.keys()]}")
+                    context.fastmcp_context.set_state("authenticated", False)
             else:
-                context.fastmcp_context.set_state("connection_id", connection_id)
+                logger.debug("Middleware: No Bearer token in Authorization header")
                 context.fastmcp_context.set_state("authenticated", False)
-                logger.debug(f"Middleware: ⚠️ No session found for {connection_id[:20]}...")
                 
         except Exception as e:
-            logger.exception(f"Middleware: Error: {e}")
-            connection_id = secrets.token_urlsafe(16)
-            context.fastmcp_context.set_state("connection_id", connection_id)
+            logger.exception(f"Middleware: Error extracting auth: {e}")
             context.fastmcp_context.set_state("authenticated", False)
         
         return await call_next(context)
 
 
 # ============================================================================
-# MCP SERVER SETUP - MUST COME BEFORE TOOL DEFINITIONS
+# MCP SERVER SETUP
 # ============================================================================
 mcp = FastMCP("Blackboard")
-mcp.add_middleware(ConnectionSessionMiddleware())
+
+# Add authentication middleware
+mcp.add_middleware(BlackboardAuthMiddleware())
 
 
 # ============================================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS FOR TOOLS
 # ============================================================================
 
-def get_user_session() -> tuple[str | None, dict | None, bool, str | None]:
+def get_user_session() -> tuple[str | None, dict | None, bool]:
     """
-    Get the current connection's session from context.
-    Returns (access_token, token_data, is_authenticated, connection_id)
+    Get the current user's session from context state.
+    Returns (access_token, token_data, is_authenticated)
     """
     try:
         ctx = get_context()
         authenticated = ctx.get_state("authenticated")
-        connection_id = ctx.get_state("connection_id")
         
         if authenticated:
             token = ctx.get_state("access_token")
             token_data = ctx.get_state("token_data")
-            return token, token_data, True, connection_id
+            logger.debug(f"get_user_session: Found authenticated session for user {token_data.get('user_id') if token_data else 'unknown'}")
+            return token, token_data, True
         
-        return None, None, False, connection_id
+        logger.debug(f"get_user_session: No authenticated session in context")
                 
     except Exception as e:
         logger.error(f"Error getting user session: {e}")
-        return None, None, False, None
+    
+    return None, None, False
 
 
-async def refresh_token_if_needed(connection_id: str) -> bool:
+# ============================================================================
+# OAUTH ROUTES
+# ============================================================================
+
+@mcp.custom_route("/login", methods=["GET"])
+async def login_page(request):
     """
-    Check if token needs refresh and refresh it if necessary.
-    Returns True if token was refreshed.
+    User-facing login page - this is what users click to start auth.
+    Separates user-initiated login from OAuth protocol endpoints.
     """
-    session = _sessions.get(connection_id)
-    if not session:
-        return False
+    state = request.query_params.get("state", "manual")
+    logger.info(f"Login: User initiated login (state={state})")
     
-    # Check if token is about to expire (within 5 minutes)
-    expires_in = session.get("expires_in", TOKEN_EXPIRY_SECONDS)
-    elapsed = time.time() - session.get("timestamp", 0)
-    remaining = expires_in - elapsed
+    # Generate our internal state to track this flow
+    our_state = secrets.token_urlsafe(32)
     
-    if remaining > 300:  # More than 5 minutes remaining
-        return False
+    # For user-initiated login, we'll redirect back to a simple success page
+    _pending_auths[our_state] = {
+        "client_id": "user_login",
+        "redirect_uri": f"{SERVER_URL}/login/success",
+        "original_state": state,
+        "code_challenge": None,
+        "timestamp": time.time(),
+        "is_user_login": True  # Flag to identify user-initiated logins
+    }
     
-    # Token expiring soon, try to refresh
-    refresh_token = session.get("refresh_token")
-    if not refresh_token:
-        logger.warning(f"No refresh token available for connection {connection_id[:20]}...")
-        return False
+    logger.info(f"Login: Created pending auth with our_state={our_state[:20]}...")
+    
+    # Build Blackboard auth URL - note the URL structure from your example
+    # Using proper URL encoding for redirect_uri
+    encoded_redirect = quote(f"{SERVER_URL}/oauth/callback", safe='')
+    
+    blackboard_auth_url = (
+        f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode"
+        f"?redirect_uri={encoded_redirect}"
+        f"&response_type=code"
+        f"&client_id={BLACKBOARD_APP_KEY}"
+        f"&scope=read%20write"
+        f"&state={our_state}"
+    )
+    
+    logger.info(f"Login: Redirecting to Blackboard: {blackboard_auth_url[:100]}...")
+    return RedirectResponse(blackboard_auth_url)
+
+
+@mcp.custom_route("/login/success", methods=["GET"])
+async def login_success(request):
+    """Success page after user login"""
+    code = request.query_params.get("code")
+    
+    # Check if we got a code (means auth succeeded)
+    if code and code in _auth_codes:
+        token_data = _auth_codes.get(code, {})
+        user_id = token_data.get("user_id", "unknown")
+        
+        return JSONResponse({
+            "status": "success",
+            "message": f"✅ Successfully logged in as user {user_id}! You can close this window and return to Claude.",
+            "user_id": user_id
+        })
+    
+    return JSONResponse({
+        "status": "success", 
+        "message": "✅ Login successful! You can close this window and return to Claude."
+    })
+
+
+@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+async def oauth_config(request):
+    """OAuth server configuration"""
+    logger.info("OAuth: Server metadata requested")
+    return JSONResponse({
+        "issuer": SERVER_URL,
+        "authorization_endpoint": f"{SERVER_URL}/oauth/authorize",
+        "token_endpoint": f"{SERVER_URL}/oauth/token",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+    })
+
+
+@mcp.custom_route("/oauth/authorize", methods=["GET"])
+async def oauth_authorize(request):
+    """OAuth authorization endpoint - redirects to Blackboard"""
+    client_id = request.query_params.get("client_id")
+    redirect_uri = request.query_params.get("redirect_uri")
+    state = request.query_params.get("state")
+    code_challenge = request.query_params.get("code_challenge")
+    
+    logger.info(f"OAuth: Authorization request - client_id={client_id}, state={state}")
+    logger.info(f"OAuth: Redirect URI: {redirect_uri}")
+    
+    # Generate our internal state to track this flow
+    our_state = secrets.token_urlsafe(32)
+    
+    _pending_auths[our_state] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "original_state": state,  # Claude's state
+        "code_challenge": code_challenge,
+        "timestamp": time.time()
+    }
+    
+    logger.info(f"OAuth: Created pending auth with our_state={our_state[:20]}...")
+    
+    # Clean up old entries
+    cleanup_expired()
+    
+    # Build Blackboard auth URL with proper encoding
+    encoded_redirect = quote(f"{SERVER_URL}/oauth/callback", safe='')
+    
+    blackboard_auth_url = (
+        f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode"
+        f"?redirect_uri={encoded_redirect}"
+        f"&response_type=code"
+        f"&client_id={BLACKBOARD_APP_KEY}"
+        f"&scope=read%20write"
+        f"&state={our_state}"
+    )
+    
+    logger.info(f"OAuth: Redirecting to Blackboard for authentication")
+    return RedirectResponse(blackboard_auth_url)
+
+
+@mcp.custom_route("/oauth/callback", methods=["GET"])
+async def oauth_callback(request):
+    """OAuth callback from Blackboard"""
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    error = request.query_params.get("error")
+    
+    logger.info(f"OAuth: Callback received - state={state[:30] if state else 'None'}..., code={'present' if code else 'missing'}")
+    
+    if error:
+        logger.error(f"OAuth: Blackboard returned error: {error}")
+        return JSONResponse({"error": error}, status_code=400)
+    
+    if not code or not state:
+        logger.error("OAuth: Missing code or state in callback")
+        return JSONResponse({"error": "missing_parameters"}, status_code=400)
+    
+    # Check if this state was already completed (duplicate callback)
+    if state in _completed_states:
+        completed = _completed_states[state]
+        logger.info(f"OAuth: Duplicate callback for completed state - showing success page")
+        # Instead of redirecting again, just show success
+        return JSONResponse({
+            "status": "success",
+            "message": "✅ Already authenticated! You can close this window and return to Claude."
+        })
+    
+    # Look up our pending auth
+    original = _pending_auths.get(state)
+    if not original:
+        # If we have active tokens, the auth likely succeeded via another callback
+        if len(_tokens) > 0:
+            logger.info(f"OAuth: Unknown state but have {len(_tokens)} active tokens - showing success")
+            return JSONResponse({
+                "status": "success",
+                "message": "✅ Authentication successful! You can close this window and return to Claude."
+            })
+        
+        logger.error(f"OAuth: Invalid state - not found in pending auths")
+        logger.debug(f"OAuth: Pending auth keys: {list(_pending_auths.keys())}")
+        return JSONResponse({
+            "error": "invalid_state",
+            "message": "Session expired or invalid. Please try logging in again from Claude."
+        }, status_code=400)
+    
+    is_user_login = original.get("is_user_login", False)
+    logger.info(f"OAuth: Processing callback - is_user_login={is_user_login}")
     
     try:
-        logger.info(f"Refreshing token for connection {connection_id[:20]}...")
+        # Exchange code with Blackboard
+        logger.info("OAuth: Exchanging authorization code for token...")
         
         credentials = f"{BLACKBOARD_APP_KEY}:{BLACKBOARD_APP_SECRET}"
         auth_header = base64.b64encode(credentials.encode()).decode()
@@ -242,153 +374,11 @@ async def refresh_token_if_needed(connection_id: str) -> bool:
                     "Content-Type": "application/x-www-form-urlencoded"
                 },
                 data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token
-                },
-                timeout=30.0
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": f"{SERVER_URL}/oauth/callback"
+                }
             )
-            
-            if response.status_code != 200:
-                logger.error(f"Token refresh failed: {response.status_code}")
-                return False
-            
-            token_data = response.json()
-            
-            # Update session with new token
-            session["access_token"] = token_data["access_token"]
-            session["expires_in"] = token_data.get("expires_in", 3600)
-            session["timestamp"] = time.time()
-            if "refresh_token" in token_data:
-                session["refresh_token"] = token_data["refresh_token"]
-            
-            _sessions[connection_id] = session
-            logger.info(f"✅ Token refreshed successfully for connection {connection_id[:20]}...")
-            return True
-            
-    except Exception as e:
-        logger.exception(f"Error refreshing token: {e}")
-        return False
-
-
-# ============================================================================
-# OAUTH ROUTES - FastMCP Compatible
-# ============================================================================
-
-@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
-async def oauth_config(request):
-    """OAuth server configuration - FastMCP client compatible"""
-    logger.info("OAuth: Server metadata requested")
-    return JSONResponse({
-        "issuer": SERVER_URL,
-        "authorization_endpoint": f"{SERVER_URL}/oauth/authorize",
-        "token_endpoint": f"{SERVER_URL}/oauth/token",
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
-        "code_challenge_methods_supported": ["S256"],
-        "scopes_supported": ["read", "write", "offline"],
-        "token_endpoint_auth_methods_supported": ["none"],
-    })
-
-
-@mcp.custom_route("/oauth/authorize", methods=["GET"])
-async def oauth_authorize(request):
-    """OAuth authorization - redirects to Blackboard"""
-    client_id = request.query_params.get("client_id")
-    redirect_uri = request.query_params.get("redirect_uri")
-    state = request.query_params.get("state")
-    code_challenge = request.query_params.get("code_challenge")
-    scope = request.query_params.get("scope", "read write offline")
-    
-    logger.info(f"OAuth: Authorization request - state/connection_id={state[:20] if state else 'missing'}...")
-    
-    connection_id = state
-    our_state = secrets.token_urlsafe(32)
-    
-    _pending_auths[our_state] = {
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "original_state": state,
-        "connection_id": connection_id,
-        "code_challenge": code_challenge,
-        "timestamp": time.time()
-    }
-    
-    logger.info(f"OAuth: Created pending auth for connection {connection_id[:20] if connection_id else 'unknown'}...")
-    
-    cleanup_expired()
-    
-    blackboard_params = {
-        'redirect_uri': f'{SERVER_URL}/oauth/callback',
-        'response_type': 'code',
-        'client_id': BLACKBOARD_APP_KEY,
-        'scope': scope,
-        'state': our_state
-    }
-    
-    blackboard_auth_url = (
-        f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode?"
-        f"{urlencode(blackboard_params)}"
-    )
-    
-    logger.info(f"OAuth: Redirecting to Blackboard")
-    return RedirectResponse(blackboard_auth_url)
-
-
-@mcp.custom_route("/oauth/callback", methods=["GET"])
-async def oauth_callback(request):
-    """OAuth callback from Blackboard"""
-    code = request.query_params.get("code")
-    state = request.query_params.get("state")
-    error = request.query_params.get("error")
-    
-    logger.info(f"OAuth: Callback from Blackboard - state={state[:20] if state else 'None'}...")
-    
-    if error:
-        logger.error(f"OAuth: Blackboard returned error: {error}")
-        return JSONResponse({"error": error}, status_code=400)
-    
-    if not code or not state:
-        logger.error("OAuth: Missing code or state")
-        return JSONResponse({"error": "missing_parameters"}, status_code=400)
-    
-    if state in _completed_states:
-        completed = _completed_states[state]
-        logger.warning(f"OAuth: Duplicate callback")
-        redirect_url = f"{completed['redirect_uri']}?code={completed['claude_code']}&state={completed['original_state']}"
-        return RedirectResponse(redirect_url)
-    
-    original = _pending_auths.get(state)
-    if not original:
-        logger.error(f"OAuth: Invalid state")
-        return JSONResponse({"error": "invalid_state"}, status_code=400)
-    
-    connection_id = original.get("connection_id")
-    logger.info(f"OAuth: Processing callback for connection {connection_id[:20] if connection_id else 'unknown'}...")
-    
-    try:
-        logger.info("OAuth: Exchanging authorization code...")
-        
-        credentials = f"{BLACKBOARD_APP_KEY}:{BLACKBOARD_APP_SECRET}"
-        auth_header = base64.b64encode(credentials.encode()).decode()
-        
-        token_data_params = {
-            "code": code,
-            "grant_type": "authorization_code",
-            "redirect_uri": f"{SERVER_URL}/oauth/callback"
-        }
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/token",
-                headers={
-                    "Authorization": f"Basic {auth_header}",
-                    "Content-Type": "application/x-www-form-urlencoded"
-                },
-                data=token_data_params,
-                timeout=30.0
-            )
-            
-            logger.debug(f"OAuth: Blackboard response: {response.status_code}")
             
             if response.status_code != 200:
                 logger.error(f"OAuth: Token exchange failed: {response.status_code} - {response.text}")
@@ -397,32 +387,31 @@ async def oauth_callback(request):
             token_data = response.json()
             access_token = token_data["access_token"]
             user_id = token_data.get("user_id", "unknown")
-            
-            logger.info(f"OAuth: ✅ Got token for user {user_id}")
+            logger.info(f"OAuth: ✅ Successfully obtained token for user {user_id}")
+            logger.debug(f"OAuth: Token: {access_token[:20]}...")
         
-        session = {
+        # Store the token immediately in _tokens for session lookup
+        token_record = {
             "access_token": access_token,
             "token_type": token_data.get("token_type", "bearer"),
             "expires_in": token_data.get("expires_in", 3600),
             "refresh_token": token_data.get("refresh_token"),
             "user_id": user_id,
-            "scope": token_data.get("scope", ""),
             "timestamp": time.time()
         }
         
-        if connection_id:
-            _sessions[connection_id] = session
-            logger.info(f"OAuth: ✅ Stored session for connection {connection_id[:20]}... (user {user_id})")
-            logger.info(f"OAuth: Total active sessions: {len(_sessions)}")
+        # Store by access_token for middleware lookup
+        _tokens[access_token] = token_record
+        logger.info(f"OAuth: Stored token in _tokens. Total tokens: {len(_tokens)}")
         
+        # Generate code for Claude's token exchange
         claude_code = secrets.token_urlsafe(32)
         
-        _auth_codes[claude_code] = {
-            "connection_id": connection_id,
-            "session": session,
-            "timestamp": time.time()
-        }
+        # Store temporarily by code for the /oauth/token endpoint
+        _auth_codes[claude_code] = token_record.copy()
+        logger.info(f"OAuth: Created auth code for Claude: {claude_code[:20]}...")
         
+        # Mark this state as completed (for duplicate handling)
         _completed_states[state] = {
             "claude_code": claude_code,
             "redirect_uri": original["redirect_uri"],
@@ -430,89 +419,75 @@ async def oauth_callback(request):
             "timestamp": time.time()
         }
         
+        # Now safe to delete from pending
         del _pending_auths[state]
         
-        redirect_url = f"{original['redirect_uri']}?code={claude_code}&state={original['original_state']}"
-        logger.info(f"OAuth: Redirecting to Claude")
+        # Build redirect URL
+        if is_user_login:
+            # For user-initiated login, redirect to success page
+            redirect_url = f"{original['redirect_uri']}?code={claude_code}"
+            logger.info(f"OAuth: User login complete, redirecting to success page")
+        else:
+            # For MCP OAuth flow, redirect back to Claude with code and state
+            redirect_url = f"{original['redirect_uri']}?code={claude_code}&state={original['original_state']}"
+            logger.info(f"OAuth: MCP OAuth complete, redirecting to Claude")
+        
+        logger.info(f"OAuth: Redirect URL: {redirect_url[:80]}...")
         return RedirectResponse(redirect_url)
         
     except Exception as e:
-        logger.exception(f"OAuth: Error: {e}")
+        logger.exception(f"OAuth: Error during token exchange: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @mcp.custom_route("/oauth/token", methods=["POST"])
 async def oauth_token(request):
-    """Token endpoint for Claude - returns connection_id as access token"""
+    """Token endpoint for Claude"""
     form = await request.form()
     code = form.get("code")
     grant_type = form.get("grant_type")
     
-    logger.info(f"OAuth: Token request from Claude - grant_type={grant_type}")
+    logger.info(f"OAuth: Token request from Claude - grant_type={grant_type}, code={'present' if code else 'missing'}")
     
-    if grant_type == "refresh_token":
-        # Handle token refresh
-        refresh_token_value = form.get("refresh_token")
-        
-        # Find session by refresh token (connection_id)
-        connection_id = refresh_token_value
-        
-        if not connection_id or connection_id not in _sessions:
-            logger.error("OAuth: Invalid refresh token")
-            return JSONResponse({"error": "invalid_grant"}, status_code=400)
-        
-        # Attempt to refresh the Blackboard token
-        refreshed = await refresh_token_if_needed(connection_id)
-        
-        if not refreshed:
-            logger.error("OAuth: Token refresh failed")
-            return JSONResponse({"error": "invalid_grant"}, status_code=400)
-        
-        session = _sessions[connection_id]
-        
-        return JSONResponse({
-            "access_token": connection_id,
-            "token_type": "bearer",
-            "expires_in": session["expires_in"],
-            "refresh_token": connection_id,  # Same as access token for our implementation
-            "scope": session.get("scope", "read write offline")
-        })
-    
-    # Normal authorization code flow
     if not code:
+        logger.error("OAuth: Missing code in token request")
         return JSONResponse({"error": "missing_code"}, status_code=400)
     
-    auth_data = _auth_codes.get(code)
+    # Look up the auth code
+    token_data = _auth_codes.get(code)
     
-    if not auth_data:
-        logger.error(f"OAuth: Invalid code")
+    if not token_data:
+        logger.error(f"OAuth: Invalid or expired authorization code: {code[:20]}...")
+        logger.debug(f"OAuth: Available auth codes: {[k[:20]+'...' for k in _auth_codes.keys()]}")
         return JSONResponse({"error": "invalid_code"}, status_code=400)
     
+    # Remove the code (one-time use)
     del _auth_codes[code]
     
-    connection_id = auth_data["connection_id"]
-    session = auth_data["session"]
+    access_token = token_data["access_token"]
     
-    if connection_id and connection_id not in _sessions:
-        _sessions[connection_id] = session
+    # Ensure token is in _tokens (should already be there from callback)
+    if access_token not in _tokens:
+        _tokens[access_token] = token_data
+        logger.info(f"OAuth: Added token to _tokens from token endpoint")
     
-    user_id = session.get("user_id")
-    logger.info(f"OAuth: ✅ Issued token for connection {connection_id[:20] if connection_id else 'unknown'}... (user {user_id})")
+    logger.info(f"OAuth: ✅ Issued token to Claude for user {token_data.get('user_id')}")
+    logger.info(f"OAuth: Token that Claude will use: {access_token[:20]}...")
+    logger.info(f"OAuth: Total tokens in storage: {len(_tokens)}")
     
-    # Return connection_id as access_token
-    # FastMCP client will send this in Authorization: Bearer header
+    # Return the Blackboard token - Claude will send this as Bearer token
     return JSONResponse({
-        "access_token": connection_id,
-        "token_type": "bearer",
-        "expires_in": session["expires_in"],
-        "refresh_token": connection_id,  # Same as access token for simplicity
-        "scope": session.get("scope", "read write offline")
+        "access_token": access_token,
+        "token_type": token_data["token_type"],
+        "expires_in": token_data["expires_in"],
+        "scope": "read write offline"
     })
 
 
 @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
 async def protected_resource_config(request):
-    """Protected resource config"""
+    """Indicate that this resource requires OAuth"""
+    logger.debug("OAuth: Protected resource metadata requested")
     return JSONResponse({
         "resource": SERVER_URL,
         "authorization_servers": [SERVER_URL]
@@ -520,25 +495,23 @@ async def protected_resource_config(request):
 
 
 # ============================================================================
-# MCP TOOLS - Blackboard API Integration
+# MCP TOOLS
 # ============================================================================
 
 @mcp.tool()
 async def get_my_courses() -> str:
-    """Get all courses you have access to in Blackboard"""
-    token, token_data, authenticated, connection_id = get_user_session()
+    """
+    Get all courses you have access to in Blackboard.
+    Requires authentication.
+    """
+    token, token_data, authenticated = get_user_session()
     
     if not authenticated or not token:
-        return get_auth_url(connection_id)
+        logger.info("Tool get_my_courses: User not authenticated")
+        return get_auth_url()
     
-    user_id = token_data.get("user_id", "unknown")
-    logger.info(f"Tool: get_my_courses for user {user_id}")
-    
-    # Try to refresh token if needed
-    await refresh_token_if_needed(connection_id)
-    
-    # Get fresh token after potential refresh
-    token = _sessions.get(connection_id, {}).get("access_token", token)
+    user_id = token_data.get("user_id", "unknown") if token_data else "unknown"
+    logger.info(f"Tool get_my_courses: Fetching courses for user {user_id}")
     
     try:
         async with httpx.AsyncClient() as client:
@@ -548,12 +521,16 @@ async def get_my_courses() -> str:
                 timeout=30.0
             )
             
+            logger.debug(f"Tool get_my_courses: Blackboard API response: {response.status_code}")
+            
             if response.status_code == 401:
-                if connection_id and connection_id in _sessions:
-                    del _sessions[connection_id]
-                return "⚠️ Your session has expired.\n\n" + get_auth_url(connection_id)
+                if token in _tokens:
+                    del _tokens[token]
+                logger.warning(f"Tool get_my_courses: Token expired for user {user_id}")
+                return "⚠️ Your session has expired.\n\n" + get_auth_url()
             
             if response.status_code != 200:
+                logger.error(f"Tool get_my_courses: API error {response.status_code}")
                 return f"Error: {response.status_code} - {response.text}"
             
             data = response.json()
@@ -566,11 +543,12 @@ async def get_my_courses() -> str:
             for course in courses:
                 result += f"• **{course.get('name', 'Unnamed')}** (ID: `{course.get('id')}`)\n"
             
+            logger.info(f"Tool get_my_courses: Returned {len(courses)} courses for user {user_id}")
             return result
             
     except Exception as e:
-        logger.exception(f"Tool error: {e}")
-        return f"Error: {str(e)}"
+        logger.exception(f"Tool get_my_courses: Error: {e}")
+        return f"Error calling Blackboard API: {str(e)}"
 
 
 @mcp.tool()
@@ -581,14 +559,14 @@ async def get_course_assignments(course_id: str) -> str:
     Args:
         course_id: The course ID from get_my_courses (e.g., "_123_1")
     """
-    token, token_data, authenticated, connection_id = get_user_session()
+    token, token_data, authenticated = get_user_session()
     
     if not authenticated or not token:
-        return get_auth_url(connection_id)
+        logger.info("Tool get_course_assignments: User not authenticated")
+        return get_auth_url()
     
-    # Try to refresh token if needed
-    await refresh_token_if_needed(connection_id)
-    token = _sessions.get(connection_id, {}).get("access_token", token)
+    user_id = token_data.get("user_id", "unknown") if token_data else "unknown"
+    logger.info(f"Tool get_course_assignments: Fetching assignments for course {course_id}, user {user_id}")
     
     try:
         async with httpx.AsyncClient() as client:
@@ -599,19 +577,22 @@ async def get_course_assignments(course_id: str) -> str:
             )
             
             if response.status_code == 401:
-                if connection_id and connection_id in _sessions:
-                    del _sessions[connection_id]
-                return "⚠️ Your session has expired.\n\n" + get_auth_url(connection_id)
+                if token in _tokens:
+                    del _tokens[token]
+                logger.warning(f"Tool get_course_assignments: Token expired for user {user_id}")
+                return "⚠️ Your session has expired.\n\n" + get_auth_url()
             
             if response.status_code != 200:
+                logger.error(f"Tool get_course_assignments: API error {response.status_code}")
                 return f"Error: {response.status_code} - {response.text}"
             
             data = response.json()
             columns = data.get("results", [])
+            
             assignments = [c for c in columns if c.get("grading", {}).get("due")]
             
             if not assignments:
-                return f"No assignments found in course `{course_id}`"
+                return f"No assignments with due dates found in course `{course_id}`"
             
             result = f"📝 Found {len(assignments)} assignments:\n\n"
             for assignment in assignments:
@@ -620,24 +601,27 @@ async def get_course_assignments(course_id: str) -> str:
                 due = assignment.get("grading", {}).get("due", "No due date")
                 result += f"• **{name}** ({points} points) - Due: {due}\n"
             
+            logger.info(f"Tool get_course_assignments: Returned {len(assignments)} assignments")
             return result
             
     except Exception as e:
-        logger.exception(f"Tool error: {e}")
+        logger.exception(f"Tool get_course_assignments: Error: {e}")
         return f"Error: {str(e)}"
 
 
 @mcp.tool()
 async def get_current_user() -> str:
-    """Get information about the currently authenticated user"""
-    token, token_data, authenticated, connection_id = get_user_session()
+    """
+    Get information about the currently authenticated Blackboard user.
+    Returns details like name, username, email, and user ID.
+    """
+    token, token_data, authenticated = get_user_session()
     
     if not authenticated or not token:
-        return get_auth_url(connection_id)
+        logger.info("Tool get_current_user: User not authenticated")
+        return get_auth_url()
     
-    # Try to refresh token if needed
-    await refresh_token_if_needed(connection_id)
-    token = _sessions.get(connection_id, {}).get("access_token", token)
+    logger.info("Tool get_current_user: Fetching current user info")
     
     try:
         async with httpx.AsyncClient() as client:
@@ -648,11 +632,13 @@ async def get_current_user() -> str:
             )
             
             if response.status_code == 401:
-                if connection_id and connection_id in _sessions:
-                    del _sessions[connection_id]
-                return "⚠️ Your session has expired.\n\n" + get_auth_url(connection_id)
+                if token in _tokens:
+                    del _tokens[token]
+                logger.warning("Tool get_current_user: Token expired")
+                return "⚠️ Your session has expired.\n\n" + get_auth_url()
             
             if response.status_code != 200:
+                logger.error(f"Tool get_current_user: API error {response.status_code}")
                 return f"Error: {response.status_code} - {response.text}"
             
             user = response.json()
@@ -672,210 +658,76 @@ async def get_current_user() -> str:
             if email:
                 result += f"• **Email:** {email}\n"
             
+            external_id = user.get('externalId', '')
+            if external_id:
+                result += f"• **External ID:** `{external_id}`\n"
+            
+            student_id = user.get('studentId', '')
+            if student_id:
+                result += f"• **Student ID:** `{student_id}`\n"
+            
+            inst_roles = user.get('institutionRoleIds', [])
+            if inst_roles:
+                result += f"• **Institution Roles:** {', '.join(inst_roles)}\n"
+            
+            availability = user.get('availability', {})
+            available = availability.get('available', 'Unknown')
+            result += f"• **Account Status:** {available}\n"
+            
+            logger.info(f"Tool get_current_user: Returned info for {user.get('userName')}")
             return result
             
     except Exception as e:
-        logger.exception(f"Tool error: {e}")
-        return f"Error: {str(e)}"
+        logger.exception(f"Tool get_current_user: Error: {e}")
+        return f"Error calling Blackboard API: {str(e)}"
 
-
-# ============================================================================
-# SESSION MANAGEMENT TOOLS - For Demo & Testing
-# ============================================================================
 
 @mcp.tool()
 async def logout() -> str:
-    """Log out from Blackboard"""
-    token, token_data, authenticated, connection_id = get_user_session()
+    """
+    Log out from Blackboard by clearing your authentication token.
+    You will need to re-authenticate to use Blackboard tools again.
+    """
+    token, token_data, authenticated = get_user_session()
     
-    if not authenticated or not connection_id:
-        return "ℹ️ You are not currently logged in."
-    
-    if connection_id in _sessions:
+    if authenticated and token and token in _tokens:
         user_id = token_data.get("user_id", "unknown") if token_data else "unknown"
-        del _sessions[connection_id]
-        
-        logger.info(f"Tool: logout - connection {connection_id[:20]}... (user {user_id})")
-        
-        return (
-            f"✅ **Successfully Logged Out**\n\n"
-            f"• User: `{user_id}`\n"
-            f"• Connection: `{connection_id[:20]}...`\n\n"
-            f"You can now authenticate as a different user."
-        )
+        del _tokens[token]
+        logger.info(f"Tool logout: Logged out user {user_id}")
+        return "✅ Successfully logged out from Blackboard.\n\nYou will need to re-authenticate to use Blackboard tools again."
     
-    return "ℹ️ No active session found."
-
-
-@mcp.tool()
-async def force_logout(connection_id_prefix: str) -> str:
-    """
-    Force logout a specific session by connection ID prefix.
-    
-    Args:
-        connection_id_prefix: First 8+ characters of the connection ID
-    """
-    if len(connection_id_prefix) < 8:
-        return "❌ Please provide at least 8 characters of the connection ID."
-    
-    cleanup_expired()
-    
-    matches = [conn_id for conn_id in _sessions.keys() if conn_id.startswith(connection_id_prefix)]
-    
-    if not matches:
-        return f"❌ No sessions found matching `{connection_id_prefix}`"
-    
-    if len(matches) > 1:
-        result = f"⚠️ Found {len(matches)} matching sessions:\n\n"
-        for conn_id in matches:
-            session = _sessions[conn_id]
-            user_id = session.get("user_id", "unknown")
-            result += f"• `{conn_id[:20]}...` - User: {user_id}\n"
-        return result + "\nProvide a longer prefix."
-    
-    conn_id = matches[0]
-    session = _sessions[conn_id]
-    user_id = session.get("user_id", "unknown")
-    
-    del _sessions[conn_id]
-    
-    return (
-        f"✅ **Force Logged Out**\n\n"
-        f"• Connection: `{conn_id[:20]}...`\n"
-        f"• User: `{user_id}`\n\n"
-        f"Active sessions: {len(_sessions)}"
-    )
-
-
-@mcp.tool()
-async def logout_all_sessions() -> str:
-    """Log out ALL active sessions"""
-    cleanup_expired()
-    
-    if not _sessions:
-        return "ℹ️ No active sessions to log out."
-    
-    session_count = len(_sessions)
-    users = [f"{s.get('user_id', 'unknown')} ({c[:12]}...)" for c, s in _sessions.items()]
-    
-    _sessions.clear()
-    
-    logger.warning(f"Tool: logout_all_sessions - Cleared {session_count} sessions")
-    
-    result = f"✅ **All Sessions Logged Out**\n\nRemoved {session_count} session(s):\n\n"
-    for user in users:
-        result += f"• {user}\n"
-    
-    return result
-
-
-@mcp.tool()
-async def list_active_sessions() -> str:
-    """List all currently active sessions"""
-    cleanup_expired()
-    
-    if not _sessions:
-        return "ℹ️ **No Active Sessions**\n\nNo users are currently authenticated."
-    
-    result = f"👥 **Active Sessions** ({len(_sessions)} total)\n\n"
-    
-    sorted_sessions = sorted(_sessions.items(), key=lambda x: x[1].get("timestamp", 0), reverse=True)
-    
-    for conn_id, session in sorted_sessions:
-        user_id = session.get("user_id", "unknown")
-        timestamp = session.get("timestamp", 0)
-        expires_in = session.get("expires_in", TOKEN_EXPIRY_SECONDS)
-        
-        age_minutes = int((time.time() - timestamp) / 60)
-        remaining_minutes = max(0, int((expires_in - (time.time() - timestamp)) / 60))
-        
-        result += f"**Connection:** `{conn_id[:20]}...`\n"
-        result += f"• User: `{user_id}`\n"
-        result += f"• Active for: {age_minutes} minutes\n"
-        result += f"• Expires in: {remaining_minutes} minutes\n\n"
-    
-    return result
-
-
-@mcp.tool()
-async def get_my_connection_id() -> str:
-    """Get your current connection ID"""
-    _, token_data, authenticated, connection_id = get_user_session()
-    
-    if not connection_id:
-        return "❌ Unable to determine connection ID."
-    
-    result = f"🔑 **Your Connection ID**\n\n• Full ID: `{connection_id}`\n• Short: `{connection_id[:20]}...`\n\n"
-    
-    if authenticated and token_data:
-        user_id = token_data.get("user_id", "unknown")
-        age_minutes = int((time.time() - token_data.get("timestamp", 0)) / 60)
-        result += f"**Session:**\n• Authenticated: ✅\n• User: `{user_id}`\n• Age: {age_minutes} minutes\n"
-    else:
-        result += "**Session:**\n• Authenticated: ❌\n"
-    
-    return result
-
-
-@mcp.tool()
-async def switch_user() -> str:
-    """Log out and get auth link to switch users"""
-    token, token_data, authenticated, connection_id = get_user_session()
-    
-    old_user = "None"
-    if authenticated and token_data:
-        old_user = token_data.get("user_id", "unknown")
-        if connection_id and connection_id in _sessions:
-            del _sessions[connection_id]
-            logger.info(f"Tool: switch_user - Logged out {old_user}")
-    
-    if not connection_id:
-        connection_id = secrets.token_urlsafe(16)
-    
-    result = f"🔄 **Switching Users**\n\n• Previous: `{old_user}`\n\n"
-    result += get_auth_url(connection_id).replace("🔐 **Authentication Required**\n\n", "")
-    
-    return result
-
-
-@mcp.tool()
-async def demo_status() -> str:
-    """Get demo environment status"""
-    cleanup_expired()
-    
-    result = "📊 **Demo Environment Status**\n\n"
-    result += f"**Active Sessions:** {len(_sessions)}\n"
-    
-    if _sessions:
-        for conn_id, session in list(_sessions.items())[:5]:
-            user_id = session.get("user_id", "unknown")
-            age = int((time.time() - session.get("timestamp", 0)) / 60)
-            result += f"  • {user_id} - {age}m ago\n"
-        if len(_sessions) > 5:
-            result += f"  • ...and {len(_sessions) - 5} more\n"
-    
-    result += f"\n**Pending OAuth:** {len(_pending_auths)}\n"
-    result += f"**Auth Codes:** {len(_auth_codes)}\n\n"
-    
-    result += "**Configuration:**\n"
-    result += f"  • Blackboard URL: {'✅' if BLACKBOARD_URL else '❌'}\n"
-    result += f"  • App Key: {'✅' if BLACKBOARD_APP_KEY else '❌'}\n"
-    result += f"  • App Secret: {'✅' if BLACKBOARD_APP_SECRET else '❌'}\n"
-    result += f"  • Server URL: {'✅' if SERVER_URL else '❌'}\n"
-    
-    return result
+    logger.info("Tool logout: No active session to log out")
+    return "ℹ️ You are not currently logged in."
 
 
 @mcp.tool()
 async def check_auth_status() -> str:
-    """Check your current authentication status"""
-    cleanup_expired()
+    """
+    Check your current authentication status with Blackboard.
+    """
+    # Enhanced debugging
+    logger.info("Tool check_auth_status: Starting auth check")
     
-    token, token_data, authenticated, connection_id = get_user_session()
+    # Log what we have in storage
+    logger.info(f"Tool check_auth_status: _tokens has {len(_tokens)} entries")
+    for k in _tokens.keys():
+        logger.debug(f"  Token key: {k[:25]}...")
+    
+    # Try to get headers directly
+    try:
+        headers = get_http_headers()
+        auth_header = headers.get("authorization", "") or headers.get("Authorization", "")
+        logger.info(f"Tool check_auth_status: Auth header present: {bool(auth_header)}")
+        if auth_header:
+            logger.info(f"Tool check_auth_status: Auth header starts with: {auth_header[:30]}...")
+    except Exception as e:
+        logger.error(f"Tool check_auth_status: Could not get headers: {e}")
+    
+    token, token_data, authenticated = get_user_session()
     
     if not authenticated or not token_data:
-        result = f"🔒 **Not Authenticated**\n\n• Connection: `{connection_id[:20] if connection_id else 'unknown'}...`\n\n"
-        return result + get_auth_url(connection_id)
+        logger.info("Tool check_auth_status: Not authenticated")
+        return "🔒 **Not Authenticated**\n\n" + get_auth_url()
     
     timestamp = token_data.get("timestamp", 0)
     expires_in = token_data.get("expires_in", TOKEN_EXPIRY_SECONDS)
@@ -883,116 +735,99 @@ async def check_auth_status() -> str:
     remaining = expires_in - elapsed
     
     if remaining <= 0:
-        if connection_id and connection_id in _sessions:
-            del _sessions[connection_id]
-        return "⏰ **Session Expired**\n\n" + get_auth_url(connection_id)
+        if token in _tokens:
+            del _tokens[token]
+        logger.info("Tool check_auth_status: Session expired")
+        return "⏰ **Session Expired**\n\n" + get_auth_url()
     
     user_id = token_data.get("user_id", "unknown")
     minutes_remaining = int(remaining / 60)
-    minutes_active = int(elapsed / 60)
     
+    logger.info(f"Tool check_auth_status: User {user_id} authenticated, {minutes_remaining}m remaining")
     return (
         f"✅ **Authenticated**\n\n"
-        f"• User: `{user_id}`\n"
-        f"• Connection: `{connection_id[:20] if connection_id else 'unknown'}...`\n"
-        f"• Active: {minutes_active} minutes\n"
-        f"• Expires: {minutes_remaining} minutes\n"
-        f"• Scope: {token_data.get('scope', 'N/A')}\n\n"
-        f"**System:** {len(_sessions)} active sessions\n"
+        f"• **User ID:** `{user_id}`\n"
+        f"• **Session expires in:** {minutes_remaining} minutes"
     )
 
 
 @mcp.tool()
 async def debug_session() -> str:
-    """Debug session information"""
+    """
+    Debug tool to see session and token information.
+    Useful for troubleshooting authentication issues.
+    """
     cleanup_expired()
     
-    token, token_data, authenticated, connection_id = get_user_session()
+    # Count tokens
+    session_tokens = len(_tokens)
+    auth_codes = len(_auth_codes)
+    pending = len(_pending_auths)
+    completed = len(_completed_states)
+    
+    # Try to get current session info
+    token, token_data, authenticated = get_user_session()
+    
+    # Try to get context state
+    ctx_info = "Unable to access"
+    try:
+        ctx = get_context()
+        ctx_authenticated = ctx.get_state("authenticated")
+        ctx_user_id = ctx.get_state("user_id")
+        ctx_token = ctx.get_state("access_token")
+        ctx_info = f"authenticated={ctx_authenticated}, user_id={ctx_user_id}, token={'present' if ctx_token else 'missing'}"
+    except Exception as e:
+        ctx_info = f"Error: {e}"
+    
+    # Try to get headers
+    headers_info = "Unable to access"
+    bearer_token = None
+    try:
+        headers = get_http_headers()
+        auth_header = headers.get("authorization", "") or headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            bearer_token = auth_header[7:]
+            in_storage = bearer_token in _tokens
+            headers_info = f"Bearer token present, in storage: {in_storage}"
+            if not in_storage:
+                headers_info += f"\n  Token: {bearer_token[:30]}..."
+                headers_info += f"\n  Stored keys: {[k[:20]+'...' for k in list(_tokens.keys())[:3]]}"
+        else:
+            headers_info = f"No Bearer token. Auth header: '{auth_header[:50]}'" if auth_header else "No auth header"
+    except Exception as e:
+        headers_info = f"Error: {e}"
     
     result = (
-        f"🔧 **Debug Info**\n\n"
-        f"**Storage:**\n"
-        f"• Active sessions: {len(_sessions)}\n"
-        f"• Pending codes: {len(_auth_codes)}\n"
-        f"• Pending OAuth: {len(_pending_auths)}\n\n"
-        f"**Current:**\n"
-        f"• Connection: `{connection_id[:20] if connection_id else 'None'}...`\n"
+        f"🔧 **Debug Session Info**\n\n"
+        f"**Token Storage:**\n"
+        f"• Active sessions (_tokens): {session_tokens}\n"
+        f"• Pending auth codes: {auth_codes}\n"
+        f"• Pending OAuth flows: {pending}\n"
+        f"• Completed states (cache): {completed}\n\n"
+        f"**Current Session:**\n"
         f"• Authenticated: {authenticated}\n"
-        f"• User: {token_data.get('user_id', 'N/A') if token_data else 'N/A'}\n\n"
-        f"**Config:**\n"
-        f"• Blackboard: `{BLACKBOARD_URL}`\n"
-        f"• Server: `{SERVER_URL}`\n\n"
-        f"**Sessions:**\n"
+        f"• User ID: {token_data.get('user_id', 'N/A') if token_data else 'N/A'}\n\n"
+        f"**Context State:**\n"
+        f"• {ctx_info}\n\n"
+        f"**HTTP Headers:**\n"
+        f"• {headers_info}\n"
     )
     
-    if _sessions:
-        for conn_id, session in _sessions.items():
-            elapsed = int(time.time() - session.get("timestamp", 0))
-            result += f"• `{conn_id[:20]}...` - {session.get('user_id', 'unknown')} - {elapsed}s\n"
-    else:
-        result += "• No active sessions\n"
-    
+    logger.info(f"Tool debug_session: Completed")
     return result
 
 
 @mcp.tool()
 async def check_config() -> str:
-    """Check server configuration"""
+    """Check server configuration and OAuth endpoints"""
     return (
         f"⚙️ **Server Configuration**\n\n"
         f"• **Blackboard URL:** `{BLACKBOARD_URL}`\n"
         f"• **App Key:** `{BLACKBOARD_APP_KEY[:8] if BLACKBOARD_APP_KEY else 'NOT SET'}...`\n"
         f"• **Server URL:** `{SERVER_URL}`\n\n"
         f"**OAuth Endpoints:**\n"
+        f"• Discovery: `{SERVER_URL}/.well-known/oauth-authorization-server`\n"
         f"• Authorize: `{SERVER_URL}/oauth/authorize`\n"
         f"• Token: `{SERVER_URL}/oauth/token`\n"
-        f"• Callback: `{SERVER_URL}/oauth/callback`\n\n"
-        f"**Blackboard:**\n"
-        f"• Auth: `{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode`\n"
-        f"• Token: `{BLACKBOARD_URL}/learn/api/public/v1/oauth2/token`\n"
+        f"• Callback: `{SERVER_URL}/oauth/callback`\n"
     )
-
-
-@mcp.tool()
-async def demo_scenario(scenario: str) -> str:
-    """
-    Quick setup for demo scenarios.
-    
-    Args:
-        scenario: "reset", "status", "student", "instructor", "admin", or "ta"
-    """
-    scenario = scenario.lower().strip()
-    
-    if scenario == "reset":
-        count = len(_sessions)
-        _sessions.clear()
-        return f"✅ Demo reset! Cleared {count} session(s)."
-    
-    elif scenario == "status":
-        return await demo_status()
-    
-    elif scenario in ["student", "instructor", "admin", "ta"]:
-        _, token_data, authenticated, connection_id = get_user_session()
-        
-        if authenticated and connection_id and connection_id in _sessions:
-            old_user = token_data.get("user_id", "unknown") if token_data else "None"
-            del _sessions[connection_id]
-        else:
-            old_user = "None"
-        
-        if not connection_id:
-            connection_id = secrets.token_urlsafe(16)
-        
-        emoji = {"student": "🎓", "instructor": "👨‍🏫", "admin": "👑", "ta": "📚"}
-        
-        return (
-            f"{emoji.get(scenario, '👤')} **Demo: {scenario.title()}**\n\n"
-            f"• Previous: `{old_user}`\n\n" +
-            get_auth_url(connection_id).replace("🔐 **Authentication Required**\n\n", "")
-        )
-    
-    else:
-        return (
-            f"❌ Unknown scenario\n\n"
-            f"Available: reset, status, student, instructor, admin, ta"
-        )
