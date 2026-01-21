@@ -1,6 +1,6 @@
 """
 Blackboard MCP Server - Cloud Version with Custom OAuth
-Uses Redis (Upstash) for persistent token storage across stateless requests
+Uses Upstash Redis HTTP API (serverless-friendly, no TCP connections)
 """
 import os
 import base64
@@ -14,7 +14,9 @@ from fastmcp import FastMCP, Context
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.dependencies import get_http_headers, get_context
 from starlette.responses import RedirectResponse, JSONResponse
-import redis
+
+# Use Upstash's HTTP-based Redis client (no TCP connection issues!)
+from upstash_redis import Redis
 
 # ============================================================================
 # LOGGING SETUP
@@ -32,7 +34,10 @@ BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL")
 BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY")
 BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET")
 SERVER_URL = os.environ.get("SERVER_URL")
-REDIS_URL = os.environ.get("REDIS_URL")  # From Upstash: rediss://default:xxx@xxx.upstash.io:6379
+
+# Upstash credentials (REST API - not TCP!)
+UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
+UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
 # Token expiry times (in seconds)
 TOKEN_EXPIRY = 3600       # 1 hour for access tokens
@@ -46,21 +51,14 @@ PREFIX_AUTHCODE = "bb:authcode:"
 PREFIX_COMPLETED = "bb:completed:"
 
 # ============================================================================
-# REDIS CLIENT
+# UPSTASH REDIS CLIENT (HTTP-based, serverless-friendly)
 # ============================================================================
 
-def get_redis() -> redis.Redis:
-    """Create a fresh Redis connection for each operation (serverless-friendly)"""
-    if not REDIS_URL:
-        raise RuntimeError("REDIS_URL environment variable is required")
-    # Create fresh connection each time - works better in serverless
-    client = redis.from_url(
-        REDIS_URL, 
-        decode_responses=True,
-        socket_connect_timeout=5,
-        socket_timeout=5
-    )
-    return client
+def get_redis() -> Redis:
+    """Get Upstash Redis client using HTTP REST API"""
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        raise RuntimeError("UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN required")
+    return Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
 
 
 # ============================================================================
@@ -109,7 +107,8 @@ def count_tokens() -> int:
     """Count active tokens"""
     try:
         r = get_redis()
-        return len(r.keys(f"{PREFIX_TOKEN}*"))
+        keys = r.keys(f"{PREFIX_TOKEN}*")
+        return len(keys) if keys else 0
     except Exception as e:
         logger.error(f"Redis: Failed to count tokens: {e}")
         return 0
@@ -648,8 +647,9 @@ async def debug_session() -> str:
     try:
         r = get_redis()
         r.ping()
-        result += f"**Redis:** ✅ Connected\n"
-        result += f"• Tokens: {count_tokens()}\n\n"
+        token_count = count_tokens()
+        result += f"**Redis:** ✅ Connected (HTTP)\n"
+        result += f"• Tokens: {token_count}\n\n"
     except Exception as e:
         result += f"**Redis:** ❌ {e}\n\n"
     
@@ -676,10 +676,11 @@ async def check_config() -> str:
     """Check server configuration."""
     redis_ok = "❌"
     try:
-        get_redis().ping()
-        redis_ok = "✅"
-    except:
-        pass
+        r = get_redis()
+        r.ping()
+        redis_ok = "✅ Connected (HTTP)"
+    except Exception as e:
+        redis_ok = f"❌ {e}"
     
     return (
         f"⚙️ **Configuration**\n\n"
