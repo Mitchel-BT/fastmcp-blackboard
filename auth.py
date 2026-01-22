@@ -291,12 +291,15 @@ else:
 # UNIFIED TOKEN GETTER
 # ============================================================================
 
-def get_bb_token() -> str:
+def get_bb_token(access_token: str = None) -> str:
     """
     Get the Blackboard access token for the current user.
     
     - Local mode: Returns token from browser OAuth flow
-    - Cloud mode: Returns token from OAuthProxy
+    - Cloud mode: Returns token from FastMCP dependency injection
+    
+    Args:
+        access_token: The access token from FastMCP (cloud mode only)
     """
     if IS_LOCAL_MODE:
         token = get_local_token()
@@ -306,13 +309,10 @@ def get_bb_token() -> str:
             )
         return token
     
-    # Cloud mode
-    from fastmcp.server.dependencies import get_access_token
-    
-    token = get_access_token()
-    if not token:
+    # Cloud mode - use the injected access_token
+    if not access_token:
         raise ValueError(
             "Not authenticated. Please connect this server through Claude's "
             "integrations/connectors to authenticate with Blackboard."
         )
-    return token
+    return access_token
