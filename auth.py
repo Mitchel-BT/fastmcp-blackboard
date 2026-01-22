@@ -291,7 +291,7 @@ else:
 # UNIFIED TOKEN GETTER
 # ============================================================================
 
-def get_bb_token(access_token: str = None) -> str:
+def get_bb_token(self, access_token: str = None) -> str:
     """
     Get the Blackboard access token for the current user.
     
@@ -302,7 +302,7 @@ def get_bb_token(access_token: str = None) -> str:
         access_token: The access token from FastMCP (cloud mode only)
     """
     if IS_LOCAL_MODE:
-        token = get_local_token()
+        token = get_local_token()  # This should still work as a standalone function
         if not token:
             raise ValueError(
                 "Not authenticated yet. Authentication should happen automatically on startup."
