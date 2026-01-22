@@ -7,7 +7,7 @@ import blackboard_client as bb
 from blackboard_client import BlackboardAPIError
 from fastmcp.server.dependencies import get_access_token
 from fastmcp import Depends
-
+from auth import IS_LOCAL_MODE, BLACKBOARD_URL, SERVER_URL, get_local_token, get_bb_token
 
 def register_testing_tools(mcp):
     """Register testing/debug tools with the MCP server"""
@@ -18,7 +18,6 @@ def register_testing_tools(mcp):
         [Debug] Show the current authentication state.
         Helps diagnose why tools might be failing.
         """
-        from auth import IS_LOCAL_MODE, BLACKBOARD_URL, SERVER_URL, get_local_token, get_bb_token
         
         result = {
             "mode": "LOCAL" if IS_LOCAL_MODE else "CLOUD",
@@ -53,7 +52,6 @@ def register_testing_tools(mcp):
         [Debug] Make a raw API call to test if the token works.
         """
         import httpx
-        from auth import BLACKBOARD_URL, get_bb_token, IS_LOCAL_MODE
         
         try:
             token = get_bb_token(access_token)
@@ -85,8 +83,6 @@ async def whoami(access_token: str = Depends(get_access_token)) -> dict:
     [Testing] Check which user is currently authenticated and their role in each course.
     Useful for verifying you're connected as the right user.
     """
-    from auth import get_bb_token
-    import blackboard as bb
     
     try:
         # Get user profile - pass access_token through
@@ -152,7 +148,6 @@ async def whoami(access_token: str = Depends(get_access_token)) -> dict:
         [Testing] Test that the Blackboard connection is working.
         Shows which mode (local/cloud) and verifies authentication.
         """
-        from auth import IS_LOCAL_MODE, BLACKBOARD_URL, SERVER_URL, get_bb_token
         
         mode = "LOCAL (stdio)" if IS_LOCAL_MODE else "CLOUD (HTTP)"
         
@@ -194,7 +189,6 @@ async def whoami(access_token: str = Depends(get_access_token)) -> dict:
         Args:
             endpoint: The API endpoint path (e.g., "/users/me" or "/courses")
         """
-        from auth import get_bb_token, BLACKBOARD_URL
         
         try:
             token = get_bb_token(access_token)
