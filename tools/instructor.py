@@ -2,33 +2,16 @@
 Instructor/Faculty-focused MCP tools for Blackboard.
 These tools are designed for instructors to view rosters, grades, and manage courses.
 Includes background tasks for long-running analytics.
+With OAuthProxy, authentication is automatic - no more token parameters!
 """
-import asyncio
-import httpx
 import re
 from datetime import datetime, timedelta
+import httpx
 
 import blackboard_client as bb
-from blackboard_client import AuthenticationRequired, BlackboardAPIError
-from auth import SERVER_URL
+from blackboard_client import BlackboardAPIError
+from auth import get_bb_token
 from fastmcp.server.dependencies import Progress
-
-
-def _auth_error_response():
-    return {
-        "error": "authentication_required",
-        "message": "Please authenticate with Blackboard first.",
-        "auth_url": f"{SERVER_URL}/auth/start"
-    }
-
-
-def _api_error_response(e: BlackboardAPIError):
-    return {
-        "error": "api_error",
-        "message": e.message,
-        "status_code": e.status_code,
-        "details": e.details
-    }
 
 
 def register_instructor_tools(mcp):
@@ -39,17 +22,17 @@ def register_instructor_tools(mcp):
     # ==========================================================================
 
     @mcp.tool()
-    async def get_course_roster(access_token: str, course_id: str) -> dict:
+    async def get_course_roster(course_id: str) -> dict:
         """
         [Instructor] Get the full roster of students enrolled in a course.
         Shows student names, emails, and enrollment status.
         
         Args:
-            access_token: Your personal access token (Claude will remember this).
             course_id: The course ID to get the roster for.
         """
         try:
-            enrollments = await bb.get_course_users(access_token, course_id)
+            token = get_bb_token()
+            enrollments = await bb.get_course_users(token, course_id)
             
             students = []
             instructors = []
@@ -82,23 +65,23 @@ def register_instructor_tools(mcp):
                 "instructors": instructors
             }
             
-        except AuthenticationRequired:
-            return _auth_error_response()
+        except ValueError as e:
+            return {"error": "not_authenticated", "message": str(e)}
         except BlackboardAPIError as e:
-            return _api_error_response(e)
+            return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
 
     @mcp.tool()
-    async def get_gradebook_overview(access_token: str, course_id: str) -> dict:
+    async def get_gradebook_overview(course_id: str) -> dict:
         """
         [Instructor] Get an overview of the gradebook for a course.
         Shows all grade columns with submission counts and averages.
         
         Args:
-            access_token: Your personal access token (Claude will remember this).
             course_id: The course ID to get gradebook overview for.
         """
         try:
-            columns = await bb.get_gradebook_columns(access_token, course_id)
+            token = get_bb_token()
+            columns = await bb.get_gradebook_columns(token, course_id)
             
             grade_items = []
             for col in columns:
@@ -120,26 +103,26 @@ def register_instructor_tools(mcp):
                 "tip": "Use get_column_grades with a column ID to see individual student grades"
             }
             
-        except AuthenticationRequired:
-            return _auth_error_response()
+        except ValueError as e:
+            return {"error": "not_authenticated", "message": str(e)}
         except BlackboardAPIError as e:
-            return _api_error_response(e)
+            return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
 
     @mcp.tool()
-    async def get_column_grades(access_token: str, course_id: str, column_id: str) -> dict:
+    async def get_column_grades(course_id: str, column_id: str) -> dict:
         """
         [Instructor] Get all student grades for a specific assignment/column.
         Shows each student's score, submission status, and feedback.
         
         Args:
-            access_token: Your personal access token (Claude will remember this).
             course_id: The course ID.
             column_id: The gradebook column ID from get_gradebook_overview.
         """
         try:
-            grades = await bb.get_column_grades(access_token, course_id, column_id)
+            token = get_bb_token()
+            grades = await bb.get_column_grades(token, course_id, column_id)
             
-            enrollments = await bb.get_course_users(access_token, course_id)
+            enrollments = await bb.get_course_users(token, course_id)
             user_map = {}
             for e in enrollments:
                 user = e.get("user", {})
@@ -183,25 +166,25 @@ def register_instructor_tools(mcp):
                 "grades": student_grades
             }
             
-        except AuthenticationRequired:
-            return _auth_error_response()
+        except ValueError as e:
+            return {"error": "not_authenticated", "message": str(e)}
         except BlackboardAPIError as e:
-            return _api_error_response(e)
+            return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
 
     @mcp.tool()
-    async def get_submission_status(access_token: str, course_id: str, column_id: str) -> dict:
+    async def get_submission_status(course_id: str, column_id: str) -> dict:
         """
         [Instructor] Get a quick summary of submission status for an assignment.
         Shows how many students have submitted, not submitted, and need grading.
         
         Args:
-            access_token: Your personal access token (Claude will remember this).
             course_id: The course ID.
             column_id: The gradebook column ID from get_gradebook_overview.
         """
         try:
-            grades = await bb.get_column_grades(access_token, course_id, column_id)
-            enrollments = await bb.get_course_users(access_token, course_id)
+            token = get_bb_token()
+            grades = await bb.get_column_grades(token, course_id, column_id)
+            enrollments = await bb.get_course_users(token, course_id)
             
             student_count = sum(1 for e in enrollments if e.get("courseRoleId") == "Student")
             
@@ -234,24 +217,24 @@ def register_instructor_tools(mcp):
                 "completion_rate": f"{(submitted/student_count*100):.1f}%" if student_count > 0 else "0%"
             }
             
-        except AuthenticationRequired:
-            return _auth_error_response()
+        except ValueError as e:
+            return {"error": "not_authenticated", "message": str(e)}
         except BlackboardAPIError as e:
-            return _api_error_response(e)
+            return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
 
     @mcp.tool()
-    async def find_inactive_students(access_token: str, course_id: str, days: int = 7) -> dict:
+    async def find_inactive_students(course_id: str, days: int = 7) -> dict:
         """
         [Instructor] Find students who haven't accessed the course recently.
         Useful for identifying students who may need outreach.
         
         Args:
-            access_token: Your personal access token (Claude will remember this).
             course_id: The course ID to check.
             days: Number of days of inactivity (default 7).
         """
         try:
-            enrollments = await bb.get_course_users(access_token, course_id)
+            token = get_bb_token()
+            enrollments = await bb.get_course_users(token, course_id)
             cutoff = datetime.utcnow() - timedelta(days=days)
             
             inactive = []
@@ -295,10 +278,10 @@ def register_instructor_tools(mcp):
                 "inactive_students": inactive
             }
             
-        except AuthenticationRequired:
-            return _auth_error_response()
+        except ValueError as e:
+            return {"error": "not_authenticated", "message": str(e)}
         except BlackboardAPIError as e:
-            return _api_error_response(e)
+            return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
 
     # ==========================================================================
     # ANALYTICS TOOLS (background tasks)
@@ -306,7 +289,6 @@ def register_instructor_tools(mcp):
 
     @mcp.tool(task=True)
     async def find_struggling_students(
-        access_token: str, 
         course_id: str,
         grade_threshold: float = 70.0,
         progress: Progress = Progress()
@@ -317,19 +299,19 @@ def register_instructor_tools(mcp):
         This runs as a background task with progress updates.
         
         Args:
-            access_token: Your personal access token.
             course_id: The course ID to analyze.
             grade_threshold: Score percentage below which a student is flagged (default 70).
         """
         try:
+            token = get_bb_token()
             await progress.set_message("Fetching course data...")
             
             # Get enrollments
-            enrollments = await bb.get_course_users(access_token, course_id)
+            enrollments = await bb.get_course_users(token, course_id)
             students = {e.get("userId"): e for e in enrollments if e.get("courseRoleId") == "Student"}
             
             # Get gradebook columns
-            columns = await bb.get_gradebook_columns(access_token, course_id)
+            columns = await bb.get_gradebook_columns(token, course_id)
             graded_columns = [c for c in columns if c.get("score", {}).get("possible")]
             
             await progress.set_total(len(graded_columns) + 1)
@@ -340,7 +322,7 @@ def register_instructor_tools(mcp):
             for col in graded_columns:
                 await progress.set_message(f"Analyzing: {col.get('name', 'Unknown')[:30]}...")
                 try:
-                    grades = await bb.get_column_grades(access_token, course_id, col["id"])
+                    grades = await bb.get_column_grades(token, course_id, col["id"])
                     possible = col.get("score", {}).get("possible", 100)
                     
                     for g in grades:
@@ -436,14 +418,13 @@ def register_instructor_tools(mcp):
                 "recommendation": f"Consider reaching out to the {len(struggling)} struggling students first."
             }
             
-        except AuthenticationRequired:
-            return _auth_error_response()
+        except ValueError as e:
+            return {"error": "not_authenticated", "message": str(e)}
         except BlackboardAPIError as e:
-            return _api_error_response(e)
+            return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
 
     @mcp.tool(task=True)
     async def find_problem_assignments(
-        access_token: str,
         course_id: str,
         threshold: float = 70.0,
         progress: Progress = Progress()
@@ -454,14 +435,14 @@ def register_instructor_tools(mcp):
         This runs as a background task with progress updates.
         
         Args:
-            access_token: Your personal access token.
             course_id: The course ID to analyze.
             threshold: Average percentage below which an assignment is flagged (default 70).
         """
         try:
+            token = get_bb_token()
             await progress.set_message("Fetching gradebook...")
             
-            columns = await bb.get_gradebook_columns(access_token, course_id)
+            columns = await bb.get_gradebook_columns(token, course_id)
             graded_columns = [c for c in columns if c.get("score", {}).get("possible")]
             
             await progress.set_total(len(graded_columns))
@@ -472,7 +453,7 @@ def register_instructor_tools(mcp):
                 await progress.set_message(f"Analyzing: {col.get('name', 'Unknown')[:30]}...")
                 
                 try:
-                    grades = await bb.get_column_grades(access_token, course_id, col["id"])
+                    grades = await bb.get_column_grades(token, course_id, col["id"])
                     possible = col.get("score", {}).get("possible", 100)
                     
                     scores = []
@@ -548,14 +529,13 @@ def register_instructor_tools(mcp):
                 "all_assignments": sorted(assignment_stats, key=lambda x: x["average"])
             }
             
-        except AuthenticationRequired:
-            return _auth_error_response()
+        except ValueError as e:
+            return {"error": "not_authenticated", "message": str(e)}
         except BlackboardAPIError as e:
-            return _api_error_response(e)
+            return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
 
     @mcp.tool(task=True)
     async def check_course_links(
-        access_token: str,
         course_id: str,
         timeout_seconds: int = 10,
         progress: Progress = Progress()
@@ -566,11 +546,11 @@ def register_instructor_tools(mcp):
         This runs as a background task with progress updates.
         
         Args:
-            access_token: Your personal access token.
             course_id: The course ID to check.
             timeout_seconds: Timeout for each link check (default 10).
         """
         try:
+            token = get_bb_token()
             await progress.set_message("Scanning course content for links...")
             
             # Get all content recursively
@@ -579,9 +559,9 @@ def register_instructor_tools(mcp):
             async def scan_content(folder_id=None):
                 try:
                     if folder_id:
-                        contents = await bb.get_content_children(access_token, course_id, folder_id)
+                        contents = await bb.get_content_children(token, course_id, folder_id)
                     else:
-                        contents = await bb.get_course_contents(access_token, course_id)
+                        contents = await bb.get_course_contents(token, course_id)
                     
                     for item in contents:
                         # Check for external link content type
@@ -682,14 +662,13 @@ def register_instructor_tools(mcp):
                 "recommendation": f"Found {len(broken)} broken links that need attention." if broken else "All links are working!"
             }
             
-        except AuthenticationRequired:
-            return _auth_error_response()
+        except ValueError as e:
+            return {"error": "not_authenticated", "message": str(e)}
         except BlackboardAPIError as e:
-            return _api_error_response(e)
+            return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
 
     @mcp.tool(task=True)
     async def get_course_health_summary(
-        access_token: str,
         course_id: str,
         progress: Progress = Progress()
     ) -> dict:
@@ -699,20 +678,20 @@ def register_instructor_tools(mcp):
         This runs as a background task with progress updates.
         
         Args:
-            access_token: Your personal access token.
             course_id: The course ID to analyze.
         """
         try:
+            token = get_bb_token()
             await progress.set_total(5)
             
             # 1. Get course info
             await progress.set_message("Fetching course info...")
-            course = await bb.get_course_details(access_token, course_id)
+            course = await bb.get_course_details(token, course_id)
             await progress.increment()
             
             # 2. Get enrollments
             await progress.set_message("Analyzing enrollment...")
-            enrollments = await bb.get_course_users(access_token, course_id)
+            enrollments = await bb.get_course_users(token, course_id)
             students = [e for e in enrollments if e.get("courseRoleId") == "Student"]
             
             # Activity analysis
@@ -740,7 +719,7 @@ def register_instructor_tools(mcp):
             
             # 3. Grade analysis
             await progress.set_message("Analyzing grades...")
-            columns = await bb.get_gradebook_columns(access_token, course_id)
+            columns = await bb.get_gradebook_columns(token, course_id)
             graded_columns = [c for c in columns if c.get("score", {}).get("possible")]
             
             assignment_avgs = []
@@ -748,7 +727,7 @@ def register_instructor_tools(mcp):
             
             for col in graded_columns[:10]:  # Limit to avoid too many API calls
                 try:
-                    grades = await bb.get_column_grades(access_token, course_id, col["id"])
+                    grades = await bb.get_column_grades(token, course_id, col["id"])
                     possible = col.get("score", {}).get("possible", 100)
                     
                     scores = []
@@ -847,10 +826,10 @@ def register_instructor_tools(mcp):
                 "recommendation": issues[0] if issues else "Course appears healthy!"
             }
             
-        except AuthenticationRequired:
-            return _auth_error_response()
+        except ValueError as e:
+            return {"error": "not_authenticated", "message": str(e)}
         except BlackboardAPIError as e:
-            return _api_error_response(e)
+            return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
 
 
 def _friendly_role(role_id: str) -> str:
