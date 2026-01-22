@@ -47,8 +47,18 @@ if not BLACKBOARD_APP_KEY or not BLACKBOARD_APP_SECRET:
 # LOCAL MODE: Token storage and browser-based OAuth
 # ============================================================================
 
-_local_token = BLACKBOARD_TOKEN  # May be pre-set or obtained via OAuth
-_token_obtained = asyncio.Event() if IS_LOCAL_MODE else None
+_local_token: str | None = BLACKBOARD_TOKEN  # May be pre-set or obtained via OAuth
+
+
+def set_local_token(token: str):
+    """Set the local token (called after OAuth completes)"""
+    global _local_token
+    _local_token = token
+
+
+def get_local_token() -> str | None:
+    """Get the current local token"""
+    return _local_token
 
 
 async def _do_local_oauth():
@@ -59,8 +69,6 @@ async def _do_local_oauth():
     3. Receive callback with code
     4. Exchange code for token
     """
-    global _local_token
-    
     from aiohttp import web
     
     callback_code = None
@@ -186,22 +194,18 @@ async def _do_local_oauth():
             raise RuntimeError(f"Token exchange failed: {response.text}")
         
         token_data = response.json()
-        _local_token = token_data["access_token"]
+        set_local_token(token_data["access_token"])
         
         print(f"\n{'='*60}", file=sys.stderr)
         print("✓ AUTHENTICATION COMPLETE!", file=sys.stderr)
-        print(f"  Token: {_local_token[:8]}...{_local_token[-4:]}", file=sys.stderr)
+        print(f"  Token: {token_data['access_token'][:8]}...{token_data['access_token'][-4:]}", file=sys.stderr)
         print(f"  Expires in: {token_data.get('expires_in', 'unknown')} seconds", file=sys.stderr)
         print(f"{'='*60}\n", file=sys.stderr)
-    
-    _token_obtained.set()
 
 
 async def ensure_local_auth():
     """Ensure we have a valid token in local mode"""
-    global _local_token
-    
-    if _local_token:
+    if get_local_token():
         return  # Already have a token
     
     await _do_local_oauth()
@@ -293,11 +297,12 @@ def get_bb_token() -> str:
     - Cloud mode: Returns token from OAuthProxy
     """
     if IS_LOCAL_MODE:
-        if not _local_token:
+        token = get_local_token()
+        if not token:
             raise ValueError(
                 "Not authenticated yet. Authentication should happen automatically on startup."
             )
-        return _local_token
+        return token
     
     # Cloud mode
     from fastmcp.server.dependencies import get_access_token
