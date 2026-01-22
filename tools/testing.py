@@ -5,18 +5,20 @@ These tools help verify the connection and check user info.
 """
 import blackboard_client as bb
 from blackboard_client import BlackboardAPIError
+from fastmcp.server.dependencies import get_access_token
+from fastmcp import Depends
 
 
 def register_testing_tools(mcp):
     """Register testing/debug tools with the MCP server"""
 
     @mcp.tool()
-    async def debug_auth_state() -> dict:
+    async def debug_auth_state(access_token: str = Depends(get_access_token)) -> dict:
         """
         [Debug] Show the current authentication state.
         Helps diagnose why tools might be failing.
         """
-        from auth import IS_LOCAL_MODE, BLACKBOARD_URL, SERVER_URL, get_local_token
+        from auth import IS_LOCAL_MODE, BLACKBOARD_URL, SERVER_URL, get_local_token, get_bb_token
         
         result = {
             "mode": "LOCAL" if IS_LOCAL_MODE else "CLOUD",
@@ -36,8 +38,7 @@ def register_testing_tools(mcp):
         
         # Try to get token via get_bb_token
         try:
-            from auth import get_bb_token
-            token = get_bb_token()
+            token = get_bb_token(access_token)
             result["get_bb_token_works"] = True
             result["token_preview"] = f"{token[:8]}...{token[-4:]}"
         except Exception as e:
@@ -47,24 +48,20 @@ def register_testing_tools(mcp):
         return result
 
     @mcp.tool()
-    async def debug_test_api_call() -> dict:
+    async def debug_test_api_call(access_token: str = Depends(get_access_token)) -> dict:
         """
         [Debug] Make a raw API call to test if the token works.
         """
         import httpx
-        from auth import BLACKBOARD_URL, get_local_token, IS_LOCAL_MODE
+        from auth import BLACKBOARD_URL, get_bb_token, IS_LOCAL_MODE
         
-        if IS_LOCAL_MODE:
-            token = get_local_token()
-        else:
-            try:
-                from auth import get_bb_token
-                token = get_bb_token()
-            except Exception as e:
-                return {"error": f"Could not get token: {e}"}
+        try:
+            token = get_bb_token(access_token)
+        except Exception as e:
+            return {"error": f"Could not get token: {e}"}
         
         if not token:
-            return {"error": "No token available", "local_token_is_none": True}
+            return {"error": "No token available", "token_is_none": True}
         
         try:
             async with httpx.AsyncClient() as client:
@@ -83,13 +80,15 @@ def register_testing_tools(mcp):
             return {"error": str(e)}
 
     @mcp.tool()
-    async def whoami() -> dict:
+    async def whoami(access_token: str = Depends(get_access_token)) -> dict:
         """
         [Testing] Check which user is currently authenticated and their role in each course.
         Useful for verifying you're connected as the right user.
         """
+        from auth import get_bb_token
+        
         try:
-            token = get_bb_token()
+            token = get_bb_token(access_token)
             
             # Get user profile
             user = await bb.get_current_user(token)
@@ -143,17 +142,18 @@ def register_testing_tools(mcp):
             }
 
     @mcp.tool()
-    async def test_connection() -> dict:
+    async def test_connection(access_token: str = Depends(get_access_token)) -> dict:
         """
         [Testing] Test that the Blackboard connection is working.
         Shows which mode (local/cloud) and verifies authentication.
         """
-        from auth import IS_LOCAL_MODE, BLACKBOARD_URL, SERVER_URL
+        from auth import IS_LOCAL_MODE, BLACKBOARD_URL, SERVER_URL, get_bb_token
         
         mode = "LOCAL (stdio)" if IS_LOCAL_MODE else "CLOUD (HTTP)"
         
         try:
-            user = await bb.get_current_user()
+            token = get_bb_token(access_token)
+            user = await bb.get_current_user(token)
             
             return {
                 "success": True,
@@ -181,7 +181,7 @@ def register_testing_tools(mcp):
             }
 
     @mcp.tool()
-    async def test_api_endpoint(endpoint: str) -> dict:
+    async def test_api_endpoint(endpoint: str, access_token: str = Depends(get_access_token)) -> dict:
         """
         [Testing] Test a raw Blackboard API endpoint.
         Useful for debugging API responses.
@@ -189,8 +189,10 @@ def register_testing_tools(mcp):
         Args:
             endpoint: The API endpoint path (e.g., "/users/me" or "/courses")
         """
+        from auth import get_bb_token, BLACKBOARD_URL
+        
         try:
-            token = get_bb_token()
+            token = get_bb_token(access_token)
             
             # Ensure endpoint starts with /
             if not endpoint.startswith("/"):
@@ -198,7 +200,6 @@ def register_testing_tools(mcp):
             
             # Make the request using the blackboard_client's base functionality
             import httpx
-            from auth import BLACKBOARD_URL
             
             url = f"{BLACKBOARD_URL}/learn/api/public/v1{endpoint}"
             
