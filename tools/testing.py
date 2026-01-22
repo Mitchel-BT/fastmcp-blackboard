@@ -77,40 +77,41 @@ def register_testing_tools(mcp):
         except Exception as e:
             return {"error": str(e)}
 
-    @mcp.tool()
 async def whoami(access_token: str = Depends(get_access_token)) -> dict:
     """
     [Testing] Check which user is currently authenticated and their role in each course.
     Useful for verifying you're connected as the right user.
     """
-    
     try:
-        # Get user profile - pass access_token through
-        user = await bb.get_current_user(access_token)
+        bb_token = get_bb_token(access_token)
+        if not bb_token:
+            return {"error": "not_authenticated", "message": "No Blackboard token available"}
+
+        # IMPORTANT: pass the Blackboard token into the client calls
+        user = await bb.get_current_user(access_token=bb_token)
         name = user.get("name", {})
-        
-        # Get courses with roles
-        memberships = await bb.get_user_courses(access_token)
-        
+
+        memberships = await bb.get_user_courses(access_token=bb_token)
+
         courses = []
         for m in memberships:
             course_id = m.get("courseId")
             role = m.get("courseRoleId")
+
             try:
-                course = await bb.get_course_details(course_id, access_token)
+                course = await bb.get_course_details(course_id, access_token=bb_token)
                 course_name = course.get("name", course_id)
-            except:
+            except Exception:
                 course_name = course_id
-            
+
             courses.append({
                 "course": course_name,
                 "role": role,
                 "course_id": course_id
             })
-        
-        # Summarize roles
-        roles = set(c["role"] for c in courses)
-        
+
+        roles = sorted({c["role"] for c in courses if c.get("role")})
+
         return {
             "success": True,
             "user": {
@@ -119,21 +120,21 @@ async def whoami(access_token: str = Depends(get_access_token)) -> dict:
                 "email": user.get("contact", {}).get("email"),
                 "user_id": user.get("id")
             },
-            "roles_summary": list(roles),
+            "roles_summary": roles,
             "is_instructor": "Instructor" in roles,
             "is_student": "Student" in roles,
             "course_count": len(courses),
             "courses": courses
         }
-        
+
     except ValueError as e:
         return {"error": "not_authenticated", "message": str(e)}
-    except bb.BlackboardAPIError as e:
+    except BlackboardAPIError as e:
         return {
             "error": "api_error",
-            "message": e.message if hasattr(e, 'message') else str(e),
-            "status_code": e.status_code if hasattr(e, 'status_code') else None,
-            "details": e.details if hasattr(e, 'details') else None
+            "message": getattr(e, "message", str(e)),
+            "status_code": getattr(e, "status_code", None),
+            "details": getattr(e, "details", None),
         }
     except Exception as e:
         return {
