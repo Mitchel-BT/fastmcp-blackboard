@@ -35,33 +35,10 @@ def register_common_tools(mcp):
             }
 
     @mcp.tool()
-    async def get_my_profile() -> dict:
-        """
-        Get your Blackboard user profile information.
-        Shows your name, email, and account details.
-        """
-        try:
-            user = await bb.get_current_user()
-            
-            name = user.get("name", {})
-            contact = user.get("contact", {})
-            
-            return {
-                "success": True,
-                "profile": {
-                    "name": f"{name.get('given', '')} {name.get('family', '')}".strip(),
-                    "username": user.get("userName"),
-                    "email": contact.get("email"),
-                    "student_id": user.get("studentId"),
-                    "institution_role": user.get("institutionRoleIds", []),
-                    "last_login": user.get("lastLogin")
-                }
-            }
-        except ValueError as e:
-            return {"error": "not_authenticated", "message": str(e)}
-        except BlackboardAPIError as e:
-            return {
-                "error": "api_error",
-                "message": e.message,
-                "details": e.details
-            }
+async def get_my_profile(access_token: str = Depends(get_access_token)) -> dict:
+    """Get your Blackboard user profile information."""
+    try:
+        user = await bb.get_current_user(access_token)  # Pass access_token
+        return {"success": True, "user": user}
+    except Exception as e:
+        return {"error": str(e)}
