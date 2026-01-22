@@ -1,75 +1,57 @@
 """
 Common MCP tools for Blackboard - used by both students and instructors.
+With OAuthProxy, authentication is automatic - no more token parameters!
 """
-from auth import SERVER_URL, get_user_info
+from auth import get_bb_token
 import blackboard_client as bb
-from blackboard_client import AuthenticationRequired, BlackboardAPIError
-
-
-def _auth_error_response():
-    return {
-        "error": "authentication_required",
-        "message": "Please authenticate with Blackboard first.",
-        "auth_url": f"{SERVER_URL}/auth/start"
-    }
+from blackboard_client import BlackboardAPIError
 
 
 def register_common_tools(mcp):
     """Register common tools with the MCP server"""
 
-    @mcp.tool()
-    async def get_auth_link() -> dict:
-        """
-        Get the link to authenticate with Blackboard.
-        Use this first if you haven't connected your Blackboard account yet.
-        """
-        return {
-            "message": "Visit this URL to connect your Blackboard account:",
-            "auth_url": f"{SERVER_URL}/auth/start",
-            "next_step": "After authenticating, copy the message shown and paste it here. I'll remember your token for this conversation."
-        }
+    # NOTE: get_auth_link is no longer needed!
+    # Users authenticate automatically when they add this server in Claude.
 
     @mcp.tool()
-    async def check_token_status(access_token: str) -> dict:
+    async def check_token_status() -> dict:
         """
         Check if your access token is valid and see how much time is remaining.
-        
-        Args:
-            access_token: Your personal access token to verify.
         """
-        user_info = get_user_info(access_token)
-
-        if not user_info:
+        try:
+            token = get_bb_token()
+            # Verify by making a simple API call
+            user = await bb.get_current_user(token)
+            return {
+                "valid": True,
+                "user_id": user.get("id"),
+                "username": user.get("userName"),
+                "message": "✅ Connected to Blackboard successfully."
+            }
+        except ValueError as e:
             return {
                 "valid": False,
-                "message": "Token not found or expired. Please re-authenticate.",
-                "auth_url": f"{SERVER_URL}/auth/start"
+                "message": str(e)
+            }
+        except BlackboardAPIError as e:
+            return {
+                "valid": False,
+                "message": f"Token may be expired: {e.message}"
             }
 
-        expires_min = user_info["expires_in_seconds"] // 60
-
-        return {
-            "valid": True,
-            "user_id": user_info["user_id"],
-            "expires_in": f"{expires_min} minutes",
-            "message": "Token is valid." if expires_min > 5 else "Token expiring soon, you may need to re-authenticate."
-        }
-
     @mcp.tool()
-    async def get_my_profile(access_token: str) -> dict:
+    async def get_my_profile() -> dict:
         """
         Get your Blackboard user profile information.
         Shows your name, email, and account details.
-        
-        Args:
-            access_token: Your personal access token (Claude will remember this).
         """
         try:
-            user = await bb.get_current_user(access_token)
-
+            token = get_bb_token()
+            user = await bb.get_current_user(token)
+            
             name = user.get("name", {})
             contact = user.get("contact", {})
-
+            
             return {
                 "success": True,
                 "profile": {
@@ -81,9 +63,8 @@ def register_common_tools(mcp):
                     "last_login": user.get("lastLogin")
                 }
             }
-
-        except AuthenticationRequired:
-            return _auth_error_response()
+        except ValueError as e:
+            return {"error": "not_authenticated", "message": str(e)}
         except BlackboardAPIError as e:
             return {
                 "error": "api_error",
