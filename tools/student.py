@@ -6,7 +6,8 @@ With OAuthProxy, authentication is automatic - no more token parameters!
 import re
 import blackboard_client as bb
 from blackboard_client import BlackboardAPIError
-
+from fastmcp.server.dependencies import get_access_token
+from fastmcp import Depends
 
 def register_student_tools(mcp):
     """Register all student tools with the MCP server"""
