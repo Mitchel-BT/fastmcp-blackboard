@@ -7,6 +7,7 @@ Works in both local (stdio) and cloud (HTTP) modes:
 """
 import os
 import sys
+
 import asyncio
 import base64
 import webbrowser
@@ -24,7 +25,8 @@ BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL")
 BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY")
 BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET")
 SERVER_URL = os.environ.get("SERVER_URL")
-
+print(f"DEBUG: BLACKBOARD_URL = {os.environ.get('BLACKBOARD_URL', 'NOT SET')}", file=sys.stderr)
+print(f"DEBUG: BLACKBOARD_APP_KEY = {os.environ.get('BLACKBOARD_APP_KEY', 'NOT SET')}", file=sys.stderr)
 # Optional: Pre-set token skips OAuth entirely (useful for CI/testing)
 BLACKBOARD_TOKEN = os.environ.get("BLACKBOARD_TOKEN")
 
