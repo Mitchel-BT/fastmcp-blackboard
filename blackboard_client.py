@@ -15,7 +15,7 @@ class BlackboardAPIError(Exception):
         super().__init__(message)
 
 
-async def make_request(endpoint: str, method: str = "GET", **kwargs) -> dict:
+async def make_request(endpoint: str, method: str = "GET", access_token: str = None, **kwargs) -> dict:
     """
     Make authenticated request to Blackboard API.
     Token is automatically retrieved from auth module.
@@ -23,6 +23,7 @@ async def make_request(endpoint: str, method: str = "GET", **kwargs) -> dict:
     Args:
         endpoint: API endpoint (without base URL)
         method: HTTP method
+        access_token: Optional access token (for cloud mode)
         **kwargs: Additional arguments for httpx
         
     Returns:
@@ -32,7 +33,7 @@ async def make_request(endpoint: str, method: str = "GET", **kwargs) -> dict:
         ValueError: If not authenticated
         BlackboardAPIError: If API returns an error
     """
-    token = get_bb_token()  # Get token from auth module
+    token = get_bb_token(access_token)  # Pass access_token to get_bb_token
 
     url = f"{BLACKBOARD_URL}/learn/api/public/v1/{endpoint}"
     headers = {"Authorization": f"Bearer {token}", **kwargs.pop("headers", {})}
@@ -61,26 +62,26 @@ async def make_request(endpoint: str, method: str = "GET", **kwargs) -> dict:
 # COURSE OPERATIONS
 # ============================================================================
 
-async def get_user_courses() -> list[dict]:
+async def get_user_courses(access_token: str = None) -> list[dict]:
     """Get all courses the user is enrolled in"""
-    result = await make_request("users/me/courses")
+    result = await make_request("users/me/courses", access_token=access_token)
     return result.get("results", [])
 
 
-async def get_course_details(course_id: str) -> dict:
+async def get_course_details(course_id: str, access_token: str = None) -> dict:
     """Get detailed information about a specific course"""
-    return await make_request(f"courses/{course_id}")
+    return await make_request(f"courses/{course_id}", access_token=access_token)
 
 
-async def get_course_contents(course_id: str) -> list[dict]:
+async def get_course_contents(course_id: str, access_token: str = None) -> list[dict]:
     """Get content items (folders, assignments, etc.) for a course"""
-    result = await make_request(f"courses/{course_id}/contents")
+    result = await make_request(f"courses/{course_id}/contents", access_token=access_token)
     return result.get("results", [])
 
 
-async def get_content_children(course_id: str, content_id: str) -> list[dict]:
+async def get_content_children(course_id: str, content_id: str, access_token: str = None) -> list[dict]:
     """Get child content items within a folder"""
-    result = await make_request(f"courses/{course_id}/contents/{content_id}/children")
+    result = await make_request(f"courses/{course_id}/contents/{content_id}/children", access_token=access_token)
     return result.get("results", [])
 
 
@@ -88,21 +89,21 @@ async def get_content_children(course_id: str, content_id: str) -> list[dict]:
 # GRADEBOOK OPERATIONS
 # ============================================================================
 
-async def get_gradebook_columns(course_id: str) -> list[dict]:
+async def get_gradebook_columns(course_id: str, access_token: str = None) -> list[dict]:
     """Get all gradebook columns for a course"""
-    result = await make_request(f"courses/{course_id}/gradebook/columns")
+    result = await make_request(f"courses/{course_id}/gradebook/columns", access_token=access_token)
     return result.get("results", [])
 
 
-async def get_my_grades(course_id: str) -> list[dict]:
+async def get_my_grades(course_id: str, access_token: str = None) -> list[dict]:
     """Get the current user's grades for a course"""
-    result = await make_request(f"courses/{course_id}/gradebook/users/me")
+    result = await make_request(f"courses/{course_id}/gradebook/users/me", access_token=access_token)
     return result.get("results", [])
 
 
-async def get_column_grades(course_id: str, column_id: str) -> list[dict]:
+async def get_column_grades(course_id: str, column_id: str, access_token: str = None) -> list[dict]:
     """Get all grades for a specific column (instructor only)"""
-    result = await make_request(f"courses/{course_id}/gradebook/columns/{column_id}/users")
+    result = await make_request(f"courses/{course_id}/gradebook/columns/{column_id}/users", access_token=access_token)
     return result.get("results", [])
 
 
@@ -110,9 +111,9 @@ async def get_column_grades(course_id: str, column_id: str) -> list[dict]:
 # ANNOUNCEMENT OPERATIONS
 # ============================================================================
 
-async def get_announcements(course_id: str) -> list[dict]:
+async def get_announcements(course_id: str, access_token: str = None) -> list[dict]:
     """Get announcements for a course"""
-    result = await make_request(f"courses/{course_id}/announcements")
+    result = await make_request(f"courses/{course_id}/announcements", access_token=access_token)
     return result.get("results", [])
 
 
@@ -120,14 +121,14 @@ async def get_announcements(course_id: str) -> list[dict]:
 # USER OPERATIONS
 # ============================================================================
 
-async def get_current_user() -> dict:
+async def get_current_user(access_token: str = None) -> dict:
     """Get the current user's profile"""
-    return await make_request("users/me")
+    return await make_request("users/me", access_token=access_token)
 
 
-async def get_course_users(course_id: str) -> list[dict]:
+async def get_course_users(course_id: str, access_token: str = None) -> list[dict]:
     """Get all users enrolled in a course (instructor only)"""
-    result = await make_request(f"courses/{course_id}/users")
+    result = await make_request(f"courses/{course_id}/users", access_token=access_token)
     return result.get("results", [])
 
 
@@ -135,13 +136,13 @@ async def get_course_users(course_id: str) -> list[dict]:
 # ASSIGNMENT/ATTEMPT OPERATIONS
 # ============================================================================
 
-async def get_assignment_attempts(course_id: str, column_id: str) -> list[dict]:
+async def get_assignment_attempts(course_id: str, column_id: str, access_token: str = None) -> list[dict]:
     """Get attempts for an assignment column"""
-    result = await make_request(f"courses/{course_id}/gradebook/columns/{column_id}/attempts")
+    result = await make_request(f"courses/{course_id}/gradebook/columns/{column_id}/attempts", access_token=access_token)
     return result.get("results", [])
 
 
-async def get_my_attempts(course_id: str, column_id: str) -> list[dict]:
+async def get_my_attempts(course_id: str, column_id: str, access_token: str = None) -> list[dict]:
     """Get current user's attempts for an assignment"""
-    result = await make_request(f"courses/{course_id}/gradebook/columns/{column_id}/users/me")
+    result = await make_request(f"courses/{course_id}/gradebook/columns/{column_id}/users/me", access_token=access_token)
     return result.get("results", []) if "results" in result else [result]
