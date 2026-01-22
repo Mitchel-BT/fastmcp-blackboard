@@ -82,6 +82,12 @@ async def whoami(access_token: str = Depends(get_access_token)) -> dict:
     [Testing] Check which user is currently authenticated and their role in each course.
     Useful for verifying you're connected as the right user.
     """
+    return {
+  "debug": True,
+  "mcp_access_token_prefix": (access_token[:12] + "...") if access_token else None,
+  "bb_token_prefix": (bb_token[:12] + "...") if bb_token else None,
+}
+
     try:
         bb_token = get_bb_token(access_token)
         if not bb_token:
