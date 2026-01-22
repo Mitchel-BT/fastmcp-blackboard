@@ -32,7 +32,7 @@ def register_instructor_tools(mcp):
         """
         try:
             token = get_bb_token()
-            enrollments = await bb.get_course_users(token, course_id)
+            enrollments = await bb.get_course_users(course_id)
             
             students = []
             instructors = []
@@ -81,7 +81,7 @@ def register_instructor_tools(mcp):
         """
         try:
             token = get_bb_token()
-            columns = await bb.get_gradebook_columns(token, course_id)
+            columns = await bb.get_gradebook_columns(course_id)
             
             grade_items = []
             for col in columns:
@@ -120,9 +120,9 @@ def register_instructor_tools(mcp):
         """
         try:
             token = get_bb_token()
-            grades = await bb.get_column_grades(token, course_id, column_id)
+            grades = await bb.get_column_grades(course_id, column_id)
             
-            enrollments = await bb.get_course_users(token, course_id)
+            enrollments = await bb.get_course_users(course_id)
             user_map = {}
             for e in enrollments:
                 user = e.get("user", {})
@@ -183,8 +183,8 @@ def register_instructor_tools(mcp):
         """
         try:
             token = get_bb_token()
-            grades = await bb.get_column_grades(token, course_id, column_id)
-            enrollments = await bb.get_course_users(token, course_id)
+            grades = await bb.get_column_grades(course_id, column_id)
+            enrollments = await bb.get_course_users(course_id)
             
             student_count = sum(1 for e in enrollments if e.get("courseRoleId") == "Student")
             
@@ -234,7 +234,7 @@ def register_instructor_tools(mcp):
         """
         try:
             token = get_bb_token()
-            enrollments = await bb.get_course_users(token, course_id)
+            enrollments = await bb.get_course_users(course_id)
             cutoff = datetime.utcnow() - timedelta(days=days)
             
             inactive = []
@@ -307,11 +307,11 @@ def register_instructor_tools(mcp):
             await progress.set_message("Fetching course data...")
             
             # Get enrollments
-            enrollments = await bb.get_course_users(token, course_id)
+            enrollments = await bb.get_course_users(course_id)
             students = {e.get("userId"): e for e in enrollments if e.get("courseRoleId") == "Student"}
             
             # Get gradebook columns
-            columns = await bb.get_gradebook_columns(token, course_id)
+            columns = await bb.get_gradebook_columns(course_id)
             graded_columns = [c for c in columns if c.get("score", {}).get("possible")]
             
             await progress.set_total(len(graded_columns) + 1)
@@ -322,7 +322,7 @@ def register_instructor_tools(mcp):
             for col in graded_columns:
                 await progress.set_message(f"Analyzing: {col.get('name', 'Unknown')[:30]}...")
                 try:
-                    grades = await bb.get_column_grades(token, course_id, col["id"])
+                    grades = await bb.get_column_grades(course_id, col["id"])
                     possible = col.get("score", {}).get("possible", 100)
                     
                     for g in grades:
@@ -442,7 +442,7 @@ def register_instructor_tools(mcp):
             token = get_bb_token()
             await progress.set_message("Fetching gradebook...")
             
-            columns = await bb.get_gradebook_columns(token, course_id)
+            columns = await bb.get_gradebook_columns(course_id)
             graded_columns = [c for c in columns if c.get("score", {}).get("possible")]
             
             await progress.set_total(len(graded_columns))
@@ -453,7 +453,7 @@ def register_instructor_tools(mcp):
                 await progress.set_message(f"Analyzing: {col.get('name', 'Unknown')[:30]}...")
                 
                 try:
-                    grades = await bb.get_column_grades(token, course_id, col["id"])
+                    grades = await bb.get_column_grades(course_id, col["id"])
                     possible = col.get("score", {}).get("possible", 100)
                     
                     scores = []
@@ -559,9 +559,9 @@ def register_instructor_tools(mcp):
             async def scan_content(folder_id=None):
                 try:
                     if folder_id:
-                        contents = await bb.get_content_children(token, course_id, folder_id)
+                        contents = await bb.get_content_children(course_id, folder_id)
                     else:
-                        contents = await bb.get_course_contents(token, course_id)
+                        contents = await bb.get_course_contents(course_id)
                     
                     for item in contents:
                         # Check for external link content type
@@ -686,12 +686,12 @@ def register_instructor_tools(mcp):
             
             # 1. Get course info
             await progress.set_message("Fetching course info...")
-            course = await bb.get_course_details(token, course_id)
+            course = await bb.get_course_details(course_id)
             await progress.increment()
             
             # 2. Get enrollments
             await progress.set_message("Analyzing enrollment...")
-            enrollments = await bb.get_course_users(token, course_id)
+            enrollments = await bb.get_course_users(course_id)
             students = [e for e in enrollments if e.get("courseRoleId") == "Student"]
             
             # Activity analysis
@@ -719,7 +719,7 @@ def register_instructor_tools(mcp):
             
             # 3. Grade analysis
             await progress.set_message("Analyzing grades...")
-            columns = await bb.get_gradebook_columns(token, course_id)
+            columns = await bb.get_gradebook_columns(course_id)
             graded_columns = [c for c in columns if c.get("score", {}).get("possible")]
             
             assignment_avgs = []
@@ -727,7 +727,7 @@ def register_instructor_tools(mcp):
             
             for col in graded_columns[:10]:  # Limit to avoid too many API calls
                 try:
-                    grades = await bb.get_column_grades(token, course_id, col["id"])
+                    grades = await bb.get_column_grades(course_id, col["id"])
                     possible = col.get("score", {}).get("possible", 100)
                     
                     scores = []

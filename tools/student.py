@@ -6,7 +6,6 @@ With OAuthProxy, authentication is automatic - no more token parameters!
 import re
 import blackboard_client as bb
 from blackboard_client import BlackboardAPIError
-from auth import get_bb_token
 
 
 def register_student_tools(mcp):
@@ -19,15 +18,14 @@ def register_student_tools(mcp):
         Returns course names, IDs, and your role in each course.
         """
         try:
-            token = get_bb_token()
-            memberships = await bb.get_user_courses(token)
+            memberships = await bb.get_user_courses()
             
             courses = []
             for m in memberships:
                 course_id = m.get("courseId")
                 # Fetch course details to get the name
                 try:
-                    course = await bb.get_course_details(token, course_id)
+                    course = await bb.get_course_details(course_id)
                     course_name = course.get("name", "Unknown Course")
                     course_code = course.get("courseId", "")
                 except:
@@ -63,14 +61,12 @@ def register_student_tools(mcp):
             course_id: The course ID from get_my_courses.
         """
         try:
-            token = get_bb_token()
-            
             # Get gradebook columns first for context
-            columns = await bb.get_gradebook_columns(token, course_id)
+            columns = await bb.get_gradebook_columns(course_id)
             column_map = {c["id"]: c for c in columns}
             
             # Get user's grades
-            grades = await bb.get_my_grades(token, course_id)
+            grades = await bb.get_my_grades(course_id)
             
             grade_items = []
             for g in grades:
@@ -111,8 +107,7 @@ def register_student_tools(mcp):
             course_id: The course ID from get_my_courses.
         """
         try:
-            token = get_bb_token()
-            announcements = await bb.get_announcements(token, course_id)
+            announcements = await bb.get_announcements(course_id)
             
             items = []
             for a in announcements:
@@ -146,12 +141,10 @@ def register_student_tools(mcp):
             folder_id: Optional - ID of a folder to browse into. Leave empty for root content.
         """
         try:
-            token = get_bb_token()
-            
             if folder_id:
-                contents = await bb.get_content_children(token, course_id, folder_id)
+                contents = await bb.get_content_children(course_id, folder_id)
             else:
-                contents = await bb.get_course_contents(token, course_id)
+                contents = await bb.get_course_contents(course_id)
             
             items = []
             for c in contents:
@@ -191,20 +184,19 @@ def register_student_tools(mcp):
             course_id: Optional - specific course ID. If omitted, checks all courses.
         """
         try:
-            token = get_bb_token()
             assignments = []
             
             if course_id:
                 course_ids = [course_id]
             else:
-                memberships = await bb.get_user_courses(token)
+                memberships = await bb.get_user_courses()
                 course_ids = [m["courseId"] for m in memberships 
                              if m.get("availability", {}).get("available") == "Yes"]
             
             for cid in course_ids[:10]:  # Limit to avoid too many API calls
                 try:
-                    columns = await bb.get_gradebook_columns(token, cid)
-                    course = await bb.get_course_details(token, cid)
+                    columns = await bb.get_gradebook_columns(cid)
+                    course = await bb.get_course_details(cid)
                     course_name = course.get("name", cid)
                     
                     for col in columns:
