@@ -153,8 +153,7 @@ def register_testing_tools(mcp):
         mode = "LOCAL (stdio)" if IS_LOCAL_MODE else "CLOUD (HTTP)"
         
         try:
-            token = get_bb_token()
-            user = await bb.get_current_user(token)
+            user = await bb.get_current_user()
             
             return {
                 "success": True,
@@ -163,8 +162,7 @@ def register_testing_tools(mcp):
                 "blackboard_url": BLACKBOARD_URL,
                 "server_url": SERVER_URL or "(not set - local mode)",
                 "connected_as": user.get("userName"),
-                "user_id": user.get("id"),
-                "token_preview": f"{token[:8]}...{token[-4:]}" if token else None
+                "user_id": user.get("id")
             }
             
         except ValueError as e:
