@@ -3,13 +3,84 @@ Testing/Debug tools for Blackboard MCP Server.
 With OAuthProxy, session management is handled automatically by FastMCP.
 These tools help verify the connection and check user info.
 """
-from auth import get_bb_token
 import blackboard_client as bb
 from blackboard_client import BlackboardAPIError
 
 
 def register_testing_tools(mcp):
     """Register testing/debug tools with the MCP server"""
+
+    @mcp.tool()
+    async def debug_auth_state() -> dict:
+        """
+        [Debug] Show the current authentication state.
+        Helps diagnose why tools might be failing.
+        """
+        from auth import IS_LOCAL_MODE, BLACKBOARD_URL, SERVER_URL, get_local_token
+        
+        result = {
+            "mode": "LOCAL" if IS_LOCAL_MODE else "CLOUD",
+            "blackboard_url": BLACKBOARD_URL,
+            "server_url": SERVER_URL or "(not set)",
+        }
+        
+        # Check local token state
+        if IS_LOCAL_MODE:
+            local_token = get_local_token()
+            result["local_token_set"] = local_token is not None
+            if local_token:
+                result["local_token_preview"] = f"{local_token[:8]}...{local_token[-4:]}"
+            else:
+                result["local_token_preview"] = None
+                result["issue"] = "Token was not stored after OAuth flow!"
+        
+        # Try to get token via get_bb_token
+        try:
+            from auth import get_bb_token
+            token = get_bb_token()
+            result["get_bb_token_works"] = True
+            result["token_preview"] = f"{token[:8]}...{token[-4:]}"
+        except Exception as e:
+            result["get_bb_token_works"] = False
+            result["get_bb_token_error"] = str(e)
+        
+        return result
+
+    @mcp.tool()
+    async def debug_test_api_call() -> dict:
+        """
+        [Debug] Make a raw API call to test if the token works.
+        """
+        import httpx
+        from auth import BLACKBOARD_URL, get_local_token, IS_LOCAL_MODE
+        
+        if IS_LOCAL_MODE:
+            token = get_local_token()
+        else:
+            try:
+                from auth import get_bb_token
+                token = get_bb_token()
+            except Exception as e:
+                return {"error": f"Could not get token: {e}"}
+        
+        if not token:
+            return {"error": "No token available", "local_token_is_none": True}
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{BLACKBOARD_URL}/learn/api/public/v1/users/me",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10.0
+                )
+                
+                return {
+                    "status_code": response.status_code,
+                    "success": response.status_code == 200,
+                    "response": response.json() if response.status_code == 200 else response.text[:500]
+                }
+        except Exception as e:
+            return {"error": str(e)}
 
     @mcp.tool()
     async def whoami() -> dict:
@@ -75,8 +146,12 @@ def register_testing_tools(mcp):
     async def test_connection() -> dict:
         """
         [Testing] Test that the Blackboard connection is working.
-        Makes a simple API call to verify authentication.
+        Shows which mode (local/cloud) and verifies authentication.
         """
+        from auth import IS_LOCAL_MODE, BLACKBOARD_URL, SERVER_URL
+        
+        mode = "LOCAL (stdio)" if IS_LOCAL_MODE else "CLOUD (HTTP)"
+        
         try:
             token = get_bb_token()
             user = await bb.get_current_user(token)
@@ -84,19 +159,25 @@ def register_testing_tools(mcp):
             return {
                 "success": True,
                 "message": "✅ Connection successful!",
+                "mode": mode,
+                "blackboard_url": BLACKBOARD_URL,
+                "server_url": SERVER_URL or "(not set - local mode)",
                 "connected_as": user.get("userName"),
-                "user_id": user.get("id")
+                "user_id": user.get("id"),
+                "token_preview": f"{token[:8]}...{token[-4:]}" if token else None
             }
             
         except ValueError as e:
             return {
                 "success": False,
+                "mode": mode,
                 "message": f"❌ Not authenticated: {str(e)}",
                 "tip": "Reconnect this server in Claude's settings to re-authenticate"
             }
         except BlackboardAPIError as e:
             return {
                 "success": False,
+                "mode": mode,
                 "message": f"❌ API error: {e.message if hasattr(e, 'message') else str(e)}",
                 "tip": "Your token may have expired. Reconnect in Claude's settings."
             }
