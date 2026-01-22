@@ -1,26 +1,31 @@
 """
-Blackboard MCP Server - Entry Point
-FastMCP Cloud runs this file. It imports and registers all tools from submodules.
+Blackboard MCP Server - Works in both local and cloud modes!
 
-With OAuthProxy, users authenticate automatically when they add this server
-in Claude - no more copying/pasting tokens!
+Local mode (Claude Desktop via stdio):
+  - Automatically opens browser for Blackboard authentication on startup
+  - Set: BLACKBOARD_URL, BLACKBOARD_APP_KEY, BLACKBOARD_APP_SECRET
+  - Run with: uvx --from git+https://github.com/Mitchel-BT/fastmcp-blackboard blackboard-mcp
+
+Cloud mode (FastMCP Cloud via HTTP):
+  - Uses OAuthProxy for automatic authentication via Claude
+  - Set: BLACKBOARD_URL, BLACKBOARD_APP_KEY, BLACKBOARD_APP_SECRET, SERVER_URL
 """
+import sys
+import asyncio
 from fastmcp import FastMCP
-from auth import auth, SERVER_URL  # Import the OAuthProxy instance
+from auth import auth, IS_LOCAL_MODE, BLACKBOARD_URL, ensure_local_auth
 from tools.common import register_common_tools
 from tools.student import register_student_tools
 from tools.instructor import register_instructor_tools
 from tools.testing import register_testing_tools
 
 # ============================================================================
-# MCP SERVER WITH OAUTH
+# MCP SERVER
 # ============================================================================
-# Pass the auth (OAuthProxy) to FastMCP - this enables automatic OAuth!
+
 mcp = FastMCP(
-    name="Blackboard",
-    auth=auth,
-    # Optional: These appear on the consent screen
-    # description="Access your Blackboard courses, grades, and assignments",
+    name="Blackboard" + (" (Local)" if IS_LOCAL_MODE else ""),
+    auth=auth,  # None in local mode, OAuthProxy in cloud mode
 )
 
 # ============================================================================
@@ -33,24 +38,31 @@ register_testing_tools(mcp)
 
 
 # ============================================================================
-# NOTES ON THE CHANGE
+# ENTRY POINT
 # ============================================================================
-# 
-# What changed:
-# 1. No more custom /auth/start and /auth/callback routes - OAuthProxy handles these
-# 2. No more templates.py needed for success/error pages - OAuthProxy has its own
-# 3. Tools no longer need access_token parameter - they call get_bb_token() from auth.py
-#
-# How it works now:
-# 1. User adds this MCP server URL in Claude (Settings > Integrations)
-# 2. Claude discovers OAuth endpoints via /.well-known/oauth-authorization-server
-# 3. Claude initiates OAuth flow, user sees consent screen, authenticates with Blackboard
-# 4. OAuthProxy stores the Blackboard token and issues a FastMCP JWT to Claude
-# 5. When tools run, get_bb_token() retrieves the stored Blackboard token
-#
-# The redirect URI registered in Blackboard should be:
-#   {SERVER_URL}/auth/callback
-#
-# For production with multiple instances, set these env vars:
-# - JWT_SIGNING_KEY: Any complex string for signing FastMCP JWTs
-# - Optionally configure Redis storage in auth.py for distributed deployments
+
+def main():
+    """Entry point for running the server"""
+    
+    if IS_LOCAL_MODE:
+        print(f"🖥️  Blackboard MCP Server (Local Mode)", file=sys.stderr)
+        print(f"   Blackboard: {BLACKBOARD_URL}", file=sys.stderr)
+        
+        # Run OAuth flow before starting the MCP server
+        # This opens the browser and gets the token
+        try:
+            asyncio.run(ensure_local_auth())
+        except Exception as e:
+            print(f"\n❌ Authentication failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        
+        print("🚀 Starting MCP server...\n", file=sys.stderr)
+    else:
+        print(f"☁️  Blackboard MCP Server (Cloud Mode)", file=sys.stderr)
+        print(f"   Blackboard: {BLACKBOARD_URL}", file=sys.stderr)
+    
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()
