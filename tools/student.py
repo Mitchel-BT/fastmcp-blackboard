@@ -13,20 +13,23 @@ def register_student_tools(mcp):
     """Register all student tools with the MCP server"""
 
     @mcp.tool()
-    async def get_my_courses() -> dict:
+    async def get_my_courses(access_token: str = Depends(get_access_token)) -> dict:
         """
         Get all courses you are enrolled in.
         Returns course names, IDs, and your role in each course.
         """
+        from auth import get_bb_token
+        
         try:
-            memberships = await bb.get_user_courses()
+            token = get_bb_token(access_token)
+            memberships = await bb.get_user_courses(token)
             
             courses = []
             for m in memberships:
                 course_id = m.get("courseId")
                 # Fetch course details to get the name
                 try:
-                    course = await bb.get_course_details(course_id)
+                    course = await bb.get_course_details(token, course_id)
                     course_name = course.get("name", "Unknown Course")
                     course_code = course.get("courseId", "")
                 except:
@@ -53,7 +56,7 @@ def register_student_tools(mcp):
             return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
 
     @mcp.tool()
-    async def get_my_grades(course_id: str) -> dict:
+    async def get_my_grades(course_id: str, access_token: str = Depends(get_access_token)) -> dict:
         """
         Get your grades for a specific course.
         Shows all graded items with your scores and feedback.
@@ -61,13 +64,17 @@ def register_student_tools(mcp):
         Args:
             course_id: The course ID from get_my_courses.
         """
+        from auth import get_bb_token
+        
         try:
+            token = get_bb_token(access_token)
+            
             # Get gradebook columns first for context
-            columns = await bb.get_gradebook_columns(course_id)
+            columns = await bb.get_gradebook_columns(token, course_id)
             column_map = {c["id"]: c for c in columns}
             
             # Get user's grades
-            grades = await bb.get_my_grades(course_id)
+            grades = await bb.get_my_grades(token, course_id)
             
             grade_items = []
             for g in grades:
@@ -99,7 +106,7 @@ def register_student_tools(mcp):
             return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
 
     @mcp.tool()
-    async def get_course_announcements(course_id: str) -> dict:
+    async def get_course_announcements(course_id: str, access_token: str = Depends(get_access_token)) -> dict:
         """
         Get announcements for a specific course.
         Shows recent announcements from instructors.
@@ -107,8 +114,11 @@ def register_student_tools(mcp):
         Args:
             course_id: The course ID from get_my_courses.
         """
+        from auth import get_bb_token
+        
         try:
-            announcements = await bb.get_announcements(course_id)
+            token = get_bb_token(access_token)
+            announcements = await bb.get_announcements(token, course_id)
             
             items = []
             for a in announcements:
@@ -132,7 +142,7 @@ def register_student_tools(mcp):
             return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
 
     @mcp.tool()
-    async def get_course_content(course_id: str, folder_id: str = None) -> dict:
+    async def get_course_content(course_id: str, folder_id: str = None, access_token: str = Depends(get_access_token)) -> dict:
         """
         Get course materials and content.
         Can browse folders to find assignments, documents, and links.
@@ -141,11 +151,15 @@ def register_student_tools(mcp):
             course_id: The course ID from get_my_courses.
             folder_id: Optional - ID of a folder to browse into. Leave empty for root content.
         """
+        from auth import get_bb_token
+        
         try:
+            token = get_bb_token(access_token)
+            
             if folder_id:
-                contents = await bb.get_content_children(course_id, folder_id)
+                contents = await bb.get_content_children(token, course_id, folder_id)
             else:
-                contents = await bb.get_course_contents(course_id)
+                contents = await bb.get_course_contents(token, course_id)
             
             items = []
             for c in contents:
@@ -176,7 +190,7 @@ def register_student_tools(mcp):
             return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
 
     @mcp.tool()
-    async def get_upcoming_assignments(course_id: str = None) -> dict:
+    async def get_upcoming_assignments(course_id: str = None, access_token: str = Depends(get_access_token)) -> dict:
         """
         Get upcoming assignments and due dates.
         Can check a specific course or all courses.
@@ -184,20 +198,23 @@ def register_student_tools(mcp):
         Args:
             course_id: Optional - specific course ID. If omitted, checks all courses.
         """
+        from auth import get_bb_token
+        
         try:
+            token = get_bb_token(access_token)
             assignments = []
             
             if course_id:
                 course_ids = [course_id]
             else:
-                memberships = await bb.get_user_courses()
+                memberships = await bb.get_user_courses(token)
                 course_ids = [m["courseId"] for m in memberships 
                              if m.get("availability", {}).get("available") == "Yes"]
             
             for cid in course_ids[:10]:  # Limit to avoid too many API calls
                 try:
-                    columns = await bb.get_gradebook_columns(cid)
-                    course = await bb.get_course_details(cid)
+                    columns = await bb.get_gradebook_columns(token, cid)
+                    course = await bb.get_course_details(token, cid)
                     course_name = course.get("name", cid)
                     
                     for col in columns:
