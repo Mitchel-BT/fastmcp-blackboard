@@ -10,6 +10,7 @@ from auth import auth, SERVER_URL  # Import the OAuthProxy instance
 from tools.common import register_common_tools
 from tools.student import register_student_tools
 from tools.instructor import register_instructor_tools
+from tools.testing import register_testing_tools
 
 # ============================================================================
 # MCP SERVER WITH OAUTH
@@ -28,6 +29,7 @@ mcp = FastMCP(
 register_common_tools(mcp)
 register_student_tools(mcp)
 register_instructor_tools(mcp)
+register_testing_tools(mcp)
 
 
 # ============================================================================
