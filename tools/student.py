@@ -13,48 +13,14 @@ def register_student_tools(mcp):
     """Register all student tools with the MCP server"""
 
     @mcp.tool()
-    async def get_my_courses(access_token: str = Depends(get_access_token)) -> dict:
-        """
-        Get all courses you are enrolled in.
-        Returns course names, IDs, and your role in each course.
-        """
-        from auth import get_bb_token
+async def get_my_courses(access_token: str = Depends(get_access_token)) -> dict:
+    """Get all courses you are enrolled in."""
+    try:
+        courses = await bb.get_user_courses(access_token)  # Pass access_token
+        return {"success": True, "courses": courses}
+    except Exception as e:
+        return {"error": str(e)}
         
-        try:
-            token = get_bb_token(access_token)
-            memberships = await bb.get_user_courses(token)
-            
-            courses = []
-            for m in memberships:
-                course_id = m.get("courseId")
-                # Fetch course details to get the name
-                try:
-                    course = await bb.get_course_details(token, course_id)
-                    course_name = course.get("name", "Unknown Course")
-                    course_code = course.get("courseId", "")
-                except:
-                    course_name = "Unknown Course"
-                    course_code = ""
-                
-                courses.append({
-                    "id": course_id,
-                    "name": course_name,
-                    "code": course_code,
-                    "role": _friendly_role(m.get("courseRoleId")),
-                    "available": m.get("availability", {}).get("available") == "Yes"
-                })
-            
-            return {
-                "success": True,
-                "count": len(courses),
-                "courses": courses
-            }
-            
-        except ValueError as e:
-            return {"error": "not_authenticated", "message": str(e)}
-        except BlackboardAPIError as e:
-            return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
-
     @mcp.tool()
     async def get_my_grades(course_id: str, access_token: str = Depends(get_access_token)) -> dict:
         """
