@@ -98,7 +98,7 @@ async def make_blackboard_request(user_token: str, endpoint: str, method: str = 
             "auth_url": f"{SERVER_URL}/auth/start"
         }
     
-    bb_token = get_bb_token(user_token)
+    bb_token = get_bb_token(access_token=user_token)
     
     if not bb_token:
         return {
