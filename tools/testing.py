@@ -7,6 +7,14 @@ from auth import IS_LOCAL_MODE, BLACKBOARD_URL, SERVER_URL, get_local_token, get
 def register_testing_tools(mcp):
     """Register testing/debug tools with the MCP server"""
     @mcp.tool()
+    async def which_server() -> dict:
+        import sys
+        return {
+            "server_file": __file__,
+            "sys_path_head": sys.path[:3],
+        }
+
+    @mcp.tool()
     async def whoami(access_token: str = Depends(get_access_token)) -> dict:
         from auth import get_bb_token  # ensures defined
         import blackboard_client as bb
