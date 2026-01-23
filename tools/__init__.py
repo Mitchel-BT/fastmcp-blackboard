@@ -10,11 +10,14 @@ Tools are organized by user role:
 With OAuthProxy, authentication is automatic when users connect through Claude.
 No more access_token parameters needed!
 """
-#from .common import register_common_tools
-#from .student import register_student_tools
-#from .instructor import register_instructor_tools
+from .common import register_common_tools
+from .student import register_student_tools
+from .instructor import register_instructor_tools
 from .testing import register_testing_tools
 
 __all__ = [
+    "register_common_tools",
+    "register_student_tools",
+    "register_instructor_tools",
     "register_testing_tools",
 ]
