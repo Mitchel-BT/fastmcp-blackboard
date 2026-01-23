@@ -35,10 +35,10 @@ def register_common_tools(mcp):
             }
 
     @mcp.tool()
-async def get_my_profile(access_token: str = Depends(get_access_token)) -> dict:
-    """Get your Blackboard user profile information."""
-    try:
-        user = await bb.get_current_user(access_token)  # Pass access_token
-        return {"success": True, "user": user}
-    except Exception as e:
-        return {"error": str(e)}
+    async def get_my_profile(access_token: str = Depends(get_access_token)) -> dict:
+        """Get your Blackboard user profile information."""
+        try:
+            user = await bb.get_current_user(access_token)  # Pass access_token
+            return {"success": True, "user": user}
+        except Exception as e:
+            return {"error": str(e)}
