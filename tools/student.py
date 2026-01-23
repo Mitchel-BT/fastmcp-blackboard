@@ -63,6 +63,53 @@ def _content_type(handler_id: str) -> str:
 
 def register_student_tools(mcp):
     """Register all student tools with the MCP server"""
+    @mcp.tool()
+    async def get_assignment_description(
+        course_id: str,
+        content_id: str,
+        include_raw_html: bool = False
+    ) -> dict:
+        """
+        Get an assignment's description/instructions by content item id.
+
+        Args:
+            course_id: Blackboard course id (e.g., "_123_1")
+            content_id: Blackboard content id for the assignment (e.g., "_17196_1")
+            include_raw_html: include raw body/instructions HTML in the response
+        """
+        try:
+            bb_token = await _resolve_bb_token()
+
+            item = await bb.get_content_item(course_id, content_id, access_token=bb_token)
+
+            # Different items may store description/instructions differently.
+            body_html = item.get("body") or item.get("instructions") or ""
+            description_text = _clean_html(body_html)
+
+            resp = {
+                "success": True,
+                "course_id": course_id,
+                "content_id": content_id,
+                "title": item.get("title"),
+                "description": description_text,
+                "note": (
+                    "Some Ultra assignments created/edited in the Learn UI may not expose "
+                    "instructions via REST (platform limitation)."
+                ),
+            }
+
+            if include_raw_html:
+                resp["raw_html"] = body_html
+
+            return resp
+
+        except ValueError as e:
+            return {"error": "not_authenticated", "message": str(e)}
+        except BlackboardAPIError as e:
+            return {"error": "api_error", "message": e.message, "status_code": e.status_code, "details": e.details}
+        except Exception as e:
+            return {"error": "unexpected_error", "message": str(e), "exception_type": type(e).__name__}
+
 
     @mcp.tool()
     async def get_my_courses(include_course_names: bool = False, limit: int = 50) -> dict:
