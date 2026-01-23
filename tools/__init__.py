@@ -16,8 +16,5 @@ from .instructor import register_instructor_tools
 from .testing import register_testing_tools
 
 __all__ = [
-    "register_common_tools",
-    "register_student_tools", 
-    "register_instructor_tools",
     "register_testing_tools",
 ]
