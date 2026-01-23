@@ -14,9 +14,9 @@ import sys
 import asyncio
 from fastmcp import FastMCP
 from auth import auth, IS_LOCAL_MODE, BLACKBOARD_URL, ensure_local_auth
-#from tools.common import register_common_tools
-#from tools.student import register_student_tools
-#from tools.instructor import register_instructor_tools
+from tools.common import register_common_tools
+from tools.student import register_student_tools
+from tools.instructor import register_instructor_tools
 from tools.testing import register_testing_tools
 
 # ============================================================================
@@ -31,9 +31,9 @@ mcp = FastMCP(
 # ============================================================================
 # REGISTER ALL TOOLS
 # ============================================================================
-#register_common_tools(mcp)
-#register_student_tools(mcp)
-#register_instructor_tools(mcp)
+register_common_tools(mcp)
+register_student_tools(mcp)
+register_instructor_tools(mcp)
 register_testing_tools(mcp)
 
 
