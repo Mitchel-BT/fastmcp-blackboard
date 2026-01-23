@@ -141,6 +141,9 @@ async def get_assignment_attempts(course_id: str, column_id: str, access_token: 
     result = await make_request(f"courses/{course_id}/gradebook/columns/{column_id}/attempts", access_token=access_token)
     return result.get("results", [])
 
+async def get_content_item(course_id: str, content_id: str, access_token: str = None) -> dict:
+    """Get a single course content item (e.g., an assignment) by content id."""
+    return await make_request(f"courses/{course_id}/contents/{content_id}", access_token=access_token)
 
 async def get_my_attempts(course_id: str, column_id: str, access_token: str = None) -> list[dict]:
     """Get current user's attempts for an assignment"""
