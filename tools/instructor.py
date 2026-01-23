@@ -228,7 +228,7 @@ def _score_goal_match(assignment_text: str, goal: dict) -> tuple[float, list[str
 
 def register_instructor_tools(mcp):
     """Register all instructor tools with the MCP server"""
-        @mcp.tool()
+    @mcp.tool()
     async def list_goal_sets() -> dict:
         """
         [Instructor/Admin] List available goal sets (if supported by your instance).
