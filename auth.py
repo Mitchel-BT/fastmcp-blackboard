@@ -1,318 +1,117 @@
-"""
-Authentication for Blackboard MCP Server.
-Works in both local (stdio) and cloud (HTTP) modes:
-
-- Local: Automatically opens browser for OAuth, runs local callback server
-- Cloud: Uses OAuthProxy for automatic authentication via Claude
-"""
 import os
-import sys
+import json
+import secrets
+from datetime import datetime, timedelta
+from cryptography.fernet import Fernet
+from typing import Optional, Dict
 
-import asyncio
-import base64
-import webbrowser
-import httpx
-from typing import Optional
-from urllib.parse import quote
-import logging
-
-logger = logging.getLogger(__name__)
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL")
-BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY")
-BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET")
-SERVER_URL = os.environ.get("SERVER_URL")
-print(f"DEBUG: BLACKBOARD_URL = {os.environ.get('BLACKBOARD_URL', 'NOT SET')}", file=sys.stderr)
-print(f"DEBUG: BLACKBOARD_APP_KEY = {os.environ.get('BLACKBOARD_APP_KEY', 'NOT SET')}", file=sys.stderr)
-# Optional: Pre-set token skips OAuth entirely (useful for CI/testing)
-BLACKBOARD_TOKEN = os.environ.get("BLACKBOARD_TOKEN")
-
-# Optional: For production deployments with multiple instances
-JWT_SIGNING_KEY = os.environ.get("JWT_SIGNING_KEY")
-
-# Determine mode based on SERVER_URL
-# - If SERVER_URL is set and not localhost → Cloud mode (use OAuthProxy)
-# - Otherwise → Local mode (use browser OAuth)
-IS_LOCAL_MODE = not SERVER_URL or SERVER_URL.startswith("http://localhost")
-
-if not BLACKBOARD_URL:
-    raise EnvironmentError("Missing BLACKBOARD_URL environment variable")
-
-if not BLACKBOARD_APP_KEY or not BLACKBOARD_APP_SECRET:
-    raise EnvironmentError("Missing BLACKBOARD_APP_KEY or BLACKBOARD_APP_SECRET")
-
-
-# ============================================================================
-# LOCAL MODE: Token storage and browser-based OAuth
-# ============================================================================
-
-_local_token: str | None = BLACKBOARD_TOKEN  # May be pre-set or obtained via OAuth
-
-
-def set_local_token(token: str):
-    """Set the local token (called after OAuth completes)"""
-    global _local_token
-    _local_token = token
-
-
-def get_local_token() -> str | None:
-    """Get the current local token"""
-    return _local_token
-
-
-async def _do_local_oauth():
-    """
-    Perform OAuth flow locally:
-    1. Start a local callback server
-    2. Open browser to Blackboard auth
-    3. Receive callback with code
-    4. Exchange code for token
-    """
-    from aiohttp import web
+class TokenManager:
+    """Manages encrypted storage of Blackboard tokens per MCP session"""
     
-    callback_code = None
-    callback_received = asyncio.Event()
-    
-    async def callback_handler(request):
-        nonlocal callback_code
-        code = request.query.get('code')
-        error = request.query.get('error')
+    def __init__(self):
+        key = os.getenv("TOKEN_ENCRYPTION_KEY")
+        if not key:
+            raise ValueError("TOKEN_ENCRYPTION_KEY environment variable must be set")
         
-        if error:
-            return web.Response(
-                text=f"""
-                <html>
-                <body style="font-family: Arial; text-align: center; margin-top: 100px;">
-                    <h1 style="color: #dc3545;">✗ Authentication Failed</h1>
-                    <p>Error: {error}</p>
-                </body>
-                </html>
-                """,
-                content_type='text/html'
-            )
+        self.cipher = Fernet(key.encode())
         
-        if code:
-            callback_code = code
-            callback_received.set()
-            return web.Response(
-                text="""
-                <html>
-                <body style="font-family: Arial; text-align: center; margin-top: 100px;">
-                    <h1 style="color: #28a745;">✓ Authentication Successful!</h1>
-                    <p>You can close this window and return to Claude.</p>
-                    <script>setTimeout(() => window.close(), 2000);</script>
-                </body>
-                </html>
-                """,
-                content_type='text/html'
-            )
+        # Session-based token storage: {mcp_session_id: encrypted_token}
+        # In production, replace with Redis or PostgreSQL
+        self._session_tokens: Dict[str, str] = {}
         
-        return web.Response(text="No code received", status=400)
-    
-    # Start callback server
-    app = web.Application()
-    app.router.add_get('/callback', callback_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    # Try different ports
-    port = 8080
-    site = None
-    for try_port in [8080, 8081, 8082, 3000, 5000]:
-        try:
-            site = web.TCPSite(runner, 'localhost', try_port)
-            await site.start()
-            port = try_port
-            break
-        except OSError:
-            continue
-    
-    if not site:
-        await runner.cleanup()
-        raise RuntimeError("Could not start local callback server - all ports in use")
-    
-    redirect_uri = f"http://localhost:{port}/callback"
-    
-    print(f"\n{'='*60}", file=sys.stderr)
-    print("BLACKBOARD AUTHENTICATION", file=sys.stderr)
-    print(f"{'='*60}", file=sys.stderr)
-    print(f"\n1. Starting local callback server on {redirect_uri}", file=sys.stderr)
-    print("2. Opening browser for authentication...", file=sys.stderr)
-    print("   Please log in and authorize the application", file=sys.stderr)
-    print(f"{'='*60}\n", file=sys.stderr)
-    
-    # Build authorization URL
-    auth_url = (
-        f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode"
-        f"?redirect_uri={quote(redirect_uri, safe='')}"
-        f"&response_type=code"
-        f"&client_id={BLACKBOARD_APP_KEY}"
-        f"&scope=read%20write%20offline"
-    )
-    
-    # Open browser
-    webbrowser.open(auth_url)
-    
-    # Wait for callback (with timeout)
-    try:
-        await asyncio.wait_for(callback_received.wait(), timeout=120)
-    except asyncio.TimeoutError:
-        await runner.cleanup()
-        raise TimeoutError(
-            "Authentication timeout (120s). Make sure to complete login in the browser. "
-            f"Also verify {redirect_uri} is registered as a redirect URI in your Blackboard app."
-        )
-    
-    # Cleanup server
-    await runner.cleanup()
-    
-    if not callback_code:
-        raise RuntimeError("No authorization code received")
-    
-    print("✓ Authorization code received", file=sys.stderr)
-    
-    # Exchange code for token
-    credentials = f"{BLACKBOARD_APP_KEY}:{BLACKBOARD_APP_SECRET}"
-    auth_header = base64.b64encode(credentials.encode()).decode()
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/token",
-            headers={
-                "Authorization": f"Basic {auth_header}",
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
-            data={
-                "grant_type": "authorization_code",
-                "code": callback_code,
-                "redirect_uri": redirect_uri
-            }
-        )
+        # Temporary auth sessions for OAuth flow: {auth_session_id: session_data}
+        self._auth_sessions: Dict[str, dict] = {}
         
-        if response.status_code != 200:
-            raise RuntimeError(f"Token exchange failed: {response.text}")
-        
-        token_data = response.json()
-        set_local_token(token_data["access_token"])
-        
-        print(f"\n{'='*60}", file=sys.stderr)
-        print("✓ AUTHENTICATION COMPLETE!", file=sys.stderr)
-        print(f"  Token: {token_data['access_token'][:8]}...{token_data['access_token'][-4:]}", file=sys.stderr)
-        print(f"  Expires in: {token_data.get('expires_in', 'unknown')} seconds", file=sys.stderr)
-        print(f"{'='*60}\n", file=sys.stderr)
-
-
-async def ensure_local_auth():
-    """Ensure we have a valid token in local mode"""
-    if get_local_token():
-        return  # Already have a token
+        print("✅ TokenManager initialized")
     
-    await _do_local_oauth()
-
-
-# ============================================================================
-# CLOUD MODE: OAuthProxy setup
-# ============================================================================
-
-auth = None  # Will be None in local mode, OAuthProxy in cloud mode
-
-if not IS_LOCAL_MODE:
-    from fastmcp.server.auth import OAuthProxy
-    from fastmcp.server.auth.verifiers import TokenVerifier
-
-    class BlackboardTokenVerifier(TokenVerifier):
-        """Custom token verifier for Blackboard's opaque tokens."""
-        
-        def __init__(self, blackboard_url: str, required_scopes: list[str] = None):
-            self.blackboard_url = blackboard_url.rstrip("/")
-            self._required_scopes = required_scopes or ["read", "write", "offline"]
-        
-        @property
-        def issuer(self) -> str:
-            return self.blackboard_url
-        
-        @property
-        def required_scopes(self) -> list[str]:
-            return self._required_scopes
-        
-        async def verify_token(self, token: str) -> Optional[dict]:
-            try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(
-                        f"{self.blackboard_url}/learn/api/public/v1/users/me",
-                        headers={"Authorization": f"Bearer {token}"},
-                        timeout=10.0
-                    )
-                    
-                    if response.status_code == 200:
-                        user_data = response.json()
-                        name_parts = user_data.get("name", {})
-                        full_name = f"{name_parts.get('given', '')} {name_parts.get('family', '')}".strip()
-                        
-                        return {
-                            "sub": user_data.get("id"),
-                            "name": full_name or user_data.get("userName"),
-                            "email": user_data.get("contact", {}).get("email"),
-                            "userName": user_data.get("userName"),
-                            "scopes": self._required_scopes,
-                        }
-                    return None
-            except Exception as e:
-                logger.error(f"Token verification error: {e}")
-                return None
-
-    token_verifier = BlackboardTokenVerifier(
-        blackboard_url=BLACKBOARD_URL,
-        required_scopes=["read", "write", "offline"]
-    )
-
-    auth = OAuthProxy(
-        upstream_authorization_endpoint=f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode",
-        upstream_token_endpoint=f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/token",
-        upstream_client_id=BLACKBOARD_APP_KEY,
-        upstream_client_secret=BLACKBOARD_APP_SECRET,
-        token_verifier=token_verifier,
-        base_url=SERVER_URL,
-        jwt_signing_key=JWT_SIGNING_KEY,
-        token_endpoint_auth_method="client_secret_basic",
-        forward_pkce=True,
-        require_authorization_consent=True,
-    )
+    def create_auth_session(self) -> str:
+        """
+        Create a temporary auth session for the OAuth flow.
+        Returns a unique session ID that the user will use to complete auth.
+        """
+        auth_session_id = secrets.token_urlsafe(32)
+        self._auth_sessions[auth_session_id] = {
+            "created_at": datetime.now(),
+            "token": None,
+            "status": "pending"
+        }
+        print(f"🔑 Created auth session: {auth_session_id[:16]}...")
+        return auth_session_id
     
-    logger.info("Running in CLOUD mode with OAuthProxy")
-else:
-    logger.info("Running in LOCAL mode with browser OAuth")
-
-
-# ============================================================================
-# UNIFIED TOKEN GETTER
-# ============================================================================
-
-def get_bb_token(access_token: str = None) -> str:
-    """
-    Get the Blackboard access token for the current user.
+    async def store_auth_token(self, auth_session_id: str, blackboard_token: dict):
+        """
+        Store the Blackboard token in a temporary auth session.
+        This is called after the user logs into Blackboard.
+        """
+        if auth_session_id not in self._auth_sessions:
+            raise ValueError(f"Invalid auth session ID: {auth_session_id[:16]}...")
+        
+        self._auth_sessions[auth_session_id]["token"] = blackboard_token
+        self._auth_sessions[auth_session_id]["status"] = "completed"
+        print(f"💾 Stored Blackboard token in auth session: {auth_session_id[:16]}...")
     
-    - Local mode: Returns token from browser OAuth flow
-    - Cloud mode: Returns token from FastMCP dependency injection
+    async def link_to_mcp_session(self, auth_session_id: str, mcp_session_id: str) -> bool:
+        """
+        Link a completed auth session to an MCP session.
+        This associates the Blackboard token with the user's MCP session.
+        """
+        if auth_session_id not in self._auth_sessions:
+            print(f"❌ Auth session not found: {auth_session_id[:16]}...")
+            return False
+        
+        auth_session = self._auth_sessions[auth_session_id]
+        
+        if auth_session["status"] != "completed" or not auth_session["token"]:
+            print(f"❌ Auth session not completed: {auth_session_id[:16]}...")
+            return False
+        
+        # Encrypt the token
+        token_json = json.dumps(auth_session["token"])
+        encrypted = self.cipher.encrypt(token_json.encode())
+        
+        # Store encrypted token for this MCP session
+        self._session_tokens[mcp_session_id] = encrypted.decode()
+        
+        # Clean up the temporary auth session
+        del self._auth_sessions[auth_session_id]
+        
+        print(f"✅ Linked Blackboard token to MCP session: {mcp_session_id[:16]}...")
+        return True
     
-    Args:
-        access_token: The access token from FastMCP (cloud mode only)
-    """
-    if IS_LOCAL_MODE:
-        token = get_local_token()
-        if not token:
-            raise ValueError(
-                "Not authenticated yet. Authentication should happen automatically on startup."
-            )
+    async def get_token(self, mcp_session_id: str) -> Optional[dict]:
+        """
+        Retrieve the Blackboard token for an MCP session.
+        Returns None if no token is stored for this session.
+        """
+        if not mcp_session_id:
+            print("❌ No MCP session ID provided")
+            return None
+        
+        encrypted = self._session_tokens.get(mcp_session_id)
+        
+        if not encrypted:
+            print(f"⚠️ No token found for session: {mcp_session_id[:16]}...")
+            return None
+        
+        # Decrypt the token
+        decrypted = self.cipher.decrypt(encrypted.encode())
+        token = json.loads(decrypted)
+        print(f"🔓 Retrieved token for session: {mcp_session_id[:16]}...")
         return token
     
-    # Cloud mode - use the injected access_token
-    if not access_token:
-        raise ValueError(
-            "Not authenticated. Please connect this server through Claude's "
-            "integrations/connectors to authenticate with Blackboard."
-        )
-    return access_token
+    async def delete_token(self, mcp_session_id: str):
+        """Remove the Blackboard token for an MCP session"""
+        if mcp_session_id in self._session_tokens:
+            del self._session_tokens[mcp_session_id]
+            print(f"🗑️ Deleted token for session: {mcp_session_id[:16]}...")
+    
+    def get_session_count(self) -> int:
+        """Get the number of active sessions (for testing/monitoring)"""
+        return len(self._session_tokens)
+    
+    def get_pending_auth_count(self) -> int:
+        """Get the number of pending auth sessions (for testing/monitoring)"""
+        return len(self._auth_sessions)
+
+# Global token manager instance
+token_manager = TokenManager()
