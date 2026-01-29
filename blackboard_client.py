@@ -1,30 +1,151 @@
-async def exchange_code_for_token(self, code: str, redirect_uri: str) -> dict:
+"""
+Blackboard API Client - handles all API requests to Blackboard Learn.
+Token is automatically retrieved from auth module - no need to pass it.
+"""
+import httpx
+from auth import BLACKBOARD_URL, get_bb_token
+
+
+class BlackboardAPIError(Exception):
+    """Raised when Blackboard API returns an error"""
+    def __init__(self, message: str, status_code: int = None, details: str = None):
+        self.message = message
+        self.status_code = status_code
+        self.details = details
+        super().__init__(message)
+
+
+async def make_request(endpoint: str, method: str = "GET", access_token: str = None, **kwargs) -> dict:
     """
-    Exchange authorization code for access token.
+    Make authenticated request to Blackboard API.
+    Token is automatically retrieved from auth module.
     
     Args:
-        code: Authorization code from Blackboard
-        redirect_uri: The redirect URI used in the auth request
+        endpoint: API endpoint (without base URL)
+        method: HTTP method
+        access_token: Optional access token (for cloud mode)
+        **kwargs: Additional arguments for httpx
         
     Returns:
-        dict: Token response with access_token, refresh_token, etc.
+        JSON response from Blackboard
+        
+    Raises:
+        ValueError: If not authenticated
+        BlackboardAPIError: If API returns an error
     """
-    token_url = f"{self.base_url}/learn/api/public/v1/oauth2/token"
-    
-    data = {
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": redirect_uri
-    }
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            token_url,
-            auth=(self.app_key, self.app_secret),
-            data=data
-        )
-        
-        if response.status_code != 200:
-            raise Exception(f"Token exchange failed: {response.text}")
-        
-        return response.json()
+    token = get_bb_token(access_token)  # Pass access_token to get_bb_token
+
+    url = f"{BLACKBOARD_URL}/learn/api/public/v1/{endpoint}"
+    headers = {"Authorization": f"Bearer {token}", **kwargs.pop("headers", {})}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.request(method, url, headers=headers, timeout=30.0, **kwargs)
+
+            if response.status_code == 401:
+                raise ValueError("Token expired or invalid. Please re-authenticate.")
+
+            if response.status_code >= 400:
+                raise BlackboardAPIError(
+                    f"API error: {response.status_code}",
+                    status_code=response.status_code,
+                    details=response.text
+                )
+
+            return response.json() if response.content else {}
+
+    except httpx.RequestError as e:
+        raise BlackboardAPIError(f"Request failed: {str(e)}")
+
+
+# ============================================================================
+# COURSE OPERATIONS
+# ============================================================================
+
+async def get_user_courses(access_token: str = None) -> list[dict]:
+    """Get all courses the user is enrolled in"""
+    result = await make_request("users/me/courses", access_token=access_token)
+    return result.get("results", [])
+
+
+async def get_course_details(course_id: str, access_token: str = None) -> dict:
+    """Get detailed information about a specific course"""
+    return await make_request(f"courses/{course_id}", access_token=access_token)
+
+
+async def get_course_contents(course_id: str, access_token: str = None) -> list[dict]:
+    """Get content items (folders, assignments, etc.) for a course"""
+    result = await make_request(f"courses/{course_id}/contents", access_token=access_token)
+    return result.get("results", [])
+
+
+async def get_content_children(course_id: str, content_id: str, access_token: str = None) -> list[dict]:
+    """Get child content items within a folder"""
+    result = await make_request(f"courses/{course_id}/contents/{content_id}/children", access_token=access_token)
+    return result.get("results", [])
+
+
+# ============================================================================
+# GRADEBOOK OPERATIONS
+# ============================================================================
+
+async def get_gradebook_columns(course_id: str, access_token: str = None) -> list[dict]:
+    """Get all gradebook columns for a course"""
+    result = await make_request(f"courses/{course_id}/gradebook/columns", access_token=access_token)
+    return result.get("results", [])
+
+
+async def get_my_grades(course_id: str, access_token: str = None) -> list[dict]:
+    """Get the current user's grades for a course"""
+    result = await make_request(f"courses/{course_id}/gradebook/users/me", access_token=access_token)
+    return result.get("results", [])
+
+
+async def get_column_grades(course_id: str, column_id: str, access_token: str = None) -> list[dict]:
+    """Get all grades for a specific column (instructor only)"""
+    result = await make_request(f"courses/{course_id}/gradebook/columns/{column_id}/users", access_token=access_token)
+    return result.get("results", [])
+
+
+# ============================================================================
+# ANNOUNCEMENT OPERATIONS
+# ============================================================================
+
+async def get_announcements(course_id: str, access_token: str = None) -> list[dict]:
+    """Get announcements for a course"""
+    result = await make_request(f"courses/{course_id}/announcements", access_token=access_token)
+    return result.get("results", [])
+
+
+# ============================================================================
+# USER OPERATIONS
+# ============================================================================
+
+async def get_current_user(access_token: str = None) -> dict:
+    """Get the current user's profile"""
+    return await make_request("users/me", access_token=access_token)
+
+
+async def get_course_users(course_id: str, access_token: str = None) -> list[dict]:
+    """Get all users enrolled in a course (instructor only)"""
+    result = await make_request(f"courses/{course_id}/users", access_token=access_token)
+    return result.get("results", [])
+
+
+# ============================================================================
+# ASSIGNMENT/ATTEMPT OPERATIONS
+# ============================================================================
+
+async def get_assignment_attempts(course_id: str, column_id: str, access_token: str = None) -> list[dict]:
+    """Get attempts for an assignment column"""
+    result = await make_request(f"courses/{course_id}/gradebook/columns/{column_id}/attempts", access_token=access_token)
+    return result.get("results", [])
+
+async def get_content_item(course_id: str, content_id: str, access_token: str = None) -> dict:
+    """Get a single course content item (e.g., an assignment) by content id."""
+    return await make_request(f"courses/{course_id}/contents/{content_id}", access_token=access_token)
+
+async def get_my_attempts(course_id: str, column_id: str, access_token: str = None) -> list[dict]:
+    """Get current user's attempts for an assignment"""
+    result = await make_request(f"courses/{course_id}/gradebook/columns/{column_id}/users/me", access_token=access_token)
+    return result.get("results", []) if "results" in result else [result]
